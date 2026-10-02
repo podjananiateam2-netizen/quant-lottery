@@ -120,28 +120,6 @@ def sync_yahoo_finance():
                     'raw_date': f"{dt_key.split('-')[2]}/{dt_key.split('-')[1]}/{dt_key.split('-')[0]}"
                 }
                 added_ftse += 1
-        
-        # Fallback to 15m intraday if latest day missing
-        df_ftse_15m = t_ftse.history(interval="15m", period="7d")
-        for idx, row in df_ftse_15m.iterrows():
-            time_str = str(idx)
-            if '16:00:00' in time_str or '16:15:00' in time_str or '16:30:00' in time_str:
-                dt_key = time_str.split(' ')[0]
-                if dt_key not in ftse_dict and not pd.isna(row['Close']):
-                    val = row['Close']
-                    val_s = f"{val:.2f}"
-                    parts = val_s.split('.')
-                    top3 = parts[0][-1] + parts[1]
-                    open_val = row['Open']
-                    diff = val - open_val
-                    diff_s = f"{abs(diff):.2f}"
-                    bot2 = diff_s.split('.')[1]
-                    ftse_dict[dt_key] = {
-                        'top3': top3, 'h': int(top3[0]), 't': int(top3[1]), 'u': int(top3[2]), 'bot2': bot2,
-                        'raw_date': f"{dt_key.split('-')[2]}/{dt_key.split('-')[1]}/{dt_key.split('-')[0]}"
-                    }
-                    added_ftse += 1
-
         logs.append(f"หุ้นอังกฤษ: ซิงค์ {added_ftse} วัน")
     except Exception as e:
         logs.append(f"หุ้นอังกฤษ: {str(e)}")
