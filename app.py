@@ -9,14 +9,35 @@ Includes:
  3. 📊 Tab 3: สถิติรวม & กราฟกำไรสะสม (Overall Stats & Analytics)
 Author: Antigravity AI
 """
-import os, sys, re, json, socket
-from datetime import datetime, date, timedelta
+import os, sys, re, json, socket, time
+from datetime import datetime, date, timedelta, timezone
 from collections import Counter
 from itertools import product
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ผลหวยหุ้น_ruay.txt")
+_LAST_AUTO_SYNC_TS = 0.0
+
+# บังคับใช้เวลาประเทศไทย (UTC+7) เสมอ แม้รันบนเซิร์ฟเวอร์ Render ที่เป็น UTC
+THAI_TZ = timezone(timedelta(hours=7))
+
+def get_thai_now():
+    return datetime.now(THAI_TZ)
+
+def get_thai_today():
+    return get_thai_now().date()
+
+def get_thai_today_str():
+    return get_thai_today().strftime('%Y-%m-%d')
+
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 PAY2 = 92
 PAY3 = 850
@@ -180,6 +201,7 @@ def save_all_lotteries(lotteries):
         f.write("\n".join(lines))
 
 def sync_yahoo_finance():
+    global _LAST_AUTO_SYNC_TS
     import urllib.request
     lotteries = load_all_lotteries()
     logs = []
@@ -201,53 +223,114 @@ def sync_yahoo_finance():
         'ดาวน์โจน': 'หุ้นดาวโจนส์',
         'มาเลย์': 'หวยมาเลย์',
         'ลาว': 'หวยลาว',
+        'ลาว Super': 'หวยลาว Super',
         'ฮานอย': 'หวยเวียดนาม/ฮานอย',
         'ฮานอยพิเศษ': 'หวยเวียดนาม/ฮานอยพิเศษ',
         'ฮานอย VIP': 'หวยเวียดนาม/ฮานอย VIP',
     }
     added_count = 0
-    today_dt = datetime.now()
+    updated_count = 0
+    today_dt = get_thai_now()
+    today_str = today_dt.strftime('%Y-%m-%d')
+    ts_bust = int(time.time() * 1000)
+
+    # ดึงเฉพาะวันนี้และเมื่อวานเสมอ (และดึงย้อนหลัง 2-6 วันเฉพาะวันที่ข้อมูลยังไม่ครบ) เพื่อให้ซิงค์ไวภายใน 1-2 วินาที
+    date_list = []
     for i in range(7):
-        d_str = (today_dt - timedelta(days=i)).strftime('%Y-%m-%d')
-        url = f"https://api66lotto.com/lotto/api/huay/prize?date={d_str}"
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                js = json.loads(resp.read().decode('utf-8'))
-            th_arr = js.get('thaiStock') or []
-            if len(th_arr) >= 4:
-                t3 = str(th_arr[3].get('topThree', '')).strip()
-                b2 = str(th_arr[3].get('bottomTwo', '')).strip()
+        d_dt = today_dt - timedelta(days=i)
+        d_str = d_dt.strftime('%Y-%m-%d')
+        if i <= 1:
+            date_list.append(d_str)
+        else:
+            is_we = d_dt.weekday() in (5, 6)
+            check_mkt = 'หวยเวียดนาม/ฮานอย VIP' if is_we else 'หุ้นอังกฤษ'
+            if d_str not in lotteries.get(check_mkt, {}):
+                date_list.append(d_str)
+
+    def fetch_one_day(d_str):
+        url = f"https://api66lotto.com/lotto/api/huay/prize?date={d_str}&_t={ts_bust}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache',
+            }
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return d_str, json.loads(resp.read().decode('utf-8'))
+
+    results_by_day = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {executor.submit(fetch_one_day, d_str): d_str for d_str in date_list}
+        for fut in futures:
+            d_str = futures[fut]
+            try:
+                results_by_day.append(fut.result())
+            except Exception as e:
+                logs.append(f"{d_str}: {str(e)}")
+
+    # Process in chronological order
+    for d_str, js in sorted(results_by_day, key=lambda x: x[0]):
+        th_arr = js.get('thaiStock') or []
+        if len(th_arr) >= 4:
+            t3 = str(th_arr[3].get('topThree', '')).strip()
+            b2 = str(th_arr[3].get('bottomTwo', '')).strip()
+            if re.match(r'^\d{3}$', t3) and re.match(r'^\d{2}$', b2):
+                d_dict = lotteries.setdefault('หุ้นไทยเย็น', {})
+                if d_str not in d_dict:
+                    added_count += 1
+                elif d_dict[d_str]['top3'] != t3 or d_dict[d_str]['bot2'] != b2:
+                    updated_count += 1
+                d_dict[d_str] = {
+                    'top3': t3, 'h': int(t3[0]), 't': int(t3[1]), 'u': int(t3[2]),
+                    'bot2': b2, 'bt': int(b2[0]), 'bu': int(b2[1]),
+                    'raw_date': f"{d_str.split('-')[2]}/{d_str.split('-')[1]}/{d_str.split('-')[0][-2:]}"
+                }
+        for item in (js.get('stock') or []):
+            raw_name = (item.get('name') or '').strip()
+            if raw_name in name_map:
+                target_name = name_map[raw_name]
+                t3 = str(item.get('topThree', '')).strip()
+                b2 = str(item.get('bottomTwo', '')).strip()
                 if re.match(r'^\d{3}$', t3) and re.match(r'^\d{2}$', b2):
-                    d_dict = lotteries.setdefault('หุ้นไทยเย็น', {})
-                    if d_str not in d_dict:
+                    save_d_str = (datetime.strptime(d_str, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d') if raw_name == 'ดาวน์โจน' else d_str
+                    d_dict = lotteries.setdefault(target_name, {})
+                    if save_d_str not in d_dict:
                         added_count += 1
-                    d_dict[d_str] = {
+                    elif d_dict[save_d_str]['top3'] != t3 or d_dict[save_d_str]['bot2'] != b2:
+                        updated_count += 1
+                    d_dict[save_d_str] = {
                         'top3': t3, 'h': int(t3[0]), 't': int(t3[1]), 'u': int(t3[2]),
                         'bot2': b2, 'bt': int(b2[0]), 'bu': int(b2[1]),
-                        'raw_date': f"{d_str.split('-')[2]}/{d_str.split('-')[1]}/{d_str.split('-')[0][-2:]}"
+                        'raw_date': f"{save_d_str.split('-')[2]}/{save_d_str.split('-')[1]}/{save_d_str.split('-')[0][-2:]}"
                     }
-            for item in (js.get('stock') or []):
-                raw_name = (item.get('name') or '').strip()
-                if raw_name in name_map:
-                    target_name = name_map[raw_name]
-                    t3 = str(item.get('topThree', '')).strip()
-                    b2 = str(item.get('bottomTwo', '')).strip()
-                    if re.match(r'^\d{3}$', t3) and re.match(r'^\d{2}$', b2):
-                        save_d_str = (datetime.strptime(d_str, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d') if raw_name == 'ดาวน์โจน' else d_str
-                        d_dict = lotteries.setdefault(target_name, {})
-                        if save_d_str not in d_dict:
-                            added_count += 1
-                        d_dict[save_d_str] = {
-                            'top3': t3, 'h': int(t3[0]), 't': int(t3[1]), 'u': int(t3[2]),
-                            'bot2': b2, 'bt': int(b2[0]), 'bu': int(b2[1]),
-                            'raw_date': f"{save_d_str.split('-')[2]}/{save_d_str.split('-')[1]}/{save_d_str.split('-')[0][-2:]}"
-                        }
-        except Exception as e:
-            logs.append(f"{d_str}: {str(e)}")
+
     save_all_lotteries(lotteries)
-    logs.insert(0, f"ซิงค์ผลหวยจริงสำเร็จ (เพิ่มใหม่ {added_count} รายการ)")
+    _LAST_AUTO_SYNC_TS = time.time()
+
+    today_drawn_names = []
+    for mkt_name, rec_map in lotteries.items():
+        if today_str in rec_map:
+            today_drawn_names.append(f"{mkt_name}({rec_map[today_str]['top3']}|{rec_map[today_str]['bot2']})")
+
+    summary_msg = f"ซิงค์สำเร็จ (เวลาไทย {today_dt.strftime('%d/%m %H:%M น.')} | เพิ่มใหม่ {added_count}"
+    if updated_count:
+        summary_msg += f", อัปเดต {updated_count}"
+    summary_msg += f" | วันนี้ออกแล้ว {len(today_drawn_names)} ตลาด)"
+    logs.insert(0, summary_msg)
     return logs
+
+def ensure_fresh_data():
+    """Auto-syncs if data hasn't been synced in the last 3 minutes."""
+    global _LAST_AUTO_SYNC_TS
+    now_ts = time.time()
+    if now_ts - _LAST_AUTO_SYNC_TS > 180:
+        _LAST_AUTO_SYNC_TS = now_ts
+        try:
+            sync_yahoo_finance()
+        except Exception:
+            pass
 
 # ==============================================================================
 # 2D ENGINE: คัด 4 ตลาดฟอร์มฮอต/วัน (Top 4 Hot Markets + สลับสูตร B วันที่ 3)
@@ -421,7 +504,12 @@ def build_2d_streams_and_portfolio(lotteries):
             all_dates_set.add(d)
         mkt_ab_stream[title] = (stream, d_map, st_a)
 
-    valid_dates = sorted([d for d in all_dates_set if sum(1 for t in mkt_ab_stream if d in mkt_ab_stream[t][1]) >= 4])
+    today_str_now = get_thai_today_str()
+    valid_dates = sorted([
+        d for d in all_dates_set
+        if sum(1 for t in mkt_ab_stream if d in mkt_ab_stream[t][1]) >= 4
+        and (d < today_str_now or sum(1 for t in mkt_ab_stream if d in mkt_ab_stream[t][1]) == len(CANDIDATE_POOL_2D))
+    ])
 
     # Track multipliers for each staking mode across valid_dates
     mult_alt = {cfg['title']: 1 for cfg in CANDIDATE_POOL_2D}
@@ -829,7 +917,45 @@ def get_regime_state_by_date(lotteries, sorted_lots, date_wd, all_dates_sorted):
                         cur_st += 1
     return state_map, cur_st
 
+def get_today_drawn_summary(lotteries, target_date_str):
+    order_list = [
+        ('นิเคอิรอบเช้า', '🇯🇵 นิเคอิเช้า', '09:30'),
+        ('จีนรอบเช้า', '🇨🇳 จีนเช้า', '10:30'),
+        ('ฮั่งเส็งรอบเช้า', '🇭🇰 ฮั่งเส็งเช้า', '11:00'),
+        ('หุ้นไต้หวัน', '🇹🇼 ไต้หวัน', '12:15'),
+        ('หุ้นเกาหลี', '🇰🇷 เกาหลี', '13:00'),
+        ('นิเคอิรอบบ่าย', '🇯🇵 นิเคอิบ่าย', '13:00'),
+        ('จีนรอบบ่าย', '🇨🇳 จีนบ่าย', '13:45'),
+        ('ฮั่งเส็งรอบบ่าย', '🇭🇰 ฮั่งเส็งบ่าย', '15:00'),
+        ('หุ้นสิงคโปร์', '🇸🇬 สิงคโปร์', '16:15'),
+        ('หุ้นไทยเย็น', '🇹🇭 ไทยเย็น', '16:30'),
+        ('หุ้นอินเดีย', '🇮🇳 อินเดีย', '17:00'),
+        ('หวยเวียดนาม/ฮานอยพิเศษ', '🇻🇳 ฮานอยพิเศษ', '17:30'),
+        ('หวยเวียดนาม/ฮานอย', '🇻🇳 ฮานอยปกติ', '18:30'),
+        ('หวยลาว Super', '🇱🇦 ลาว Super', '19:00'),
+        ('หวยเวียดนาม/ฮานอย VIP', '🇻🇳 ฮานอย VIP', '19:30'),
+        ('หุ้นอียิปต์', '🇪🇬 อียิปต์', '20:00'),
+        ('หวยลาว', '🇱🇦 ลาวพัฒนา', '20:30'),
+        ('หุ้นรัสเซีย', '🇷🇺 รัสเซีย', '22:45'),
+        ('หุ้นเยอรมัน', '🇩🇪 เยอรมัน', '23:00'),
+        ('หุ้นอังกฤษ', '🇬🇧 อังกฤษ', '23:30'),
+        ('หุ้นดาวโจนส์', '🇺🇸 ดาวโจนส์', '03:30'),
+    ]
+    out = []
+    for k, label, tm in order_list:
+        rec = lotteries.get(k, {}).get(target_date_str)
+        if rec:
+            out.append({
+                'key': k,
+                'label': label,
+                'time': tm,
+                'top3': rec['top3'],
+                'bot2': rec['bot2']
+            })
+    return out
+
 def calculate_picks(target_date_str=None):
+    ensure_fresh_data()
     lotteries = load_all_lotteries()
     all_dates = set()
     for lot_dict in lotteries.values():
@@ -842,8 +968,8 @@ def calculate_picks(target_date_str=None):
     mkt_ab_stream, _, _, mult_alt_live, mult_boost_live, _ = build_2d_streams_and_portfolio(lotteries)
 
     if not target_date_str:
-        target_date_str = date.today().strftime('%Y-%m-%d')
-        target_dt = date.today()
+        target_dt = get_thai_today()
+        target_date_str = target_dt.strftime('%Y-%m-%d')
     else:
         target_dt = datetime.strptime(target_date_str, '%Y-%m-%d').date()
         
@@ -892,6 +1018,9 @@ def calculate_picks(target_date_str=None):
         nums_3d_alt = [f"{h}{t}{u}" for h in alt_3d['h'] for t in alt_3d['t'] for u in alt_3d['u']]
         
         actual_item = lotteries.get(key_name, {}).get(target_date_str)
+        hit_3d = None
+        if actual_item:
+            hit_3d = (actual_item['h'] in active_3d['h']) and (actual_item['t'] in active_3d['t']) and (actual_item['u'] in active_3d['u'])
         
         picks_3d.append({
             'lottery_key': key_name,
@@ -911,92 +1040,216 @@ def calculate_picks(target_date_str=None):
             'nums_3d_space': " ".join(nums_3d),
             'nums_3d_alt_count': len(nums_3d_alt),
             'nums_3d_alt_comma': ",".join(nums_3d_alt),
-            'actual_top3': actual_item['top3'] if actual_item else None
+            'actual_top3': actual_item['top3'] if actual_item else None,
+            'actual_bot2': actual_item['bot2'] if actual_item else None,
+            'hit_3d': hit_3d,
         })
-        
-    return picks_3d, picks_2d_top4, picks_2d_backup, is_weekend, use_formula_b, prev_streak
+
+    today_drawn = get_today_drawn_summary(lotteries, target_date_str)
+    return picks_3d, picks_2d_top4, picks_2d_backup, is_weekend, use_formula_b, prev_streak, today_drawn, target_date_str
 
 def generate_history_data():
+    ensure_fresh_data()
     lotteries = load_all_lotteries()
+    today_str = get_thai_today_str()
     all_dates = set()
     for lot_dict in lotteries.values():
         all_dates.update(lot_dict.keys())
+    all_dates.add(today_str)
     all_dates_sorted = sorted(list(all_dates))
     date_wd = {d: datetime.strptime(d, '%Y-%m-%d').weekday() for d in all_dates_sorted}
     sorted_lots = {k: sorted(v.items(), key=lambda x: x[0]) for k, v in lotteries.items()}
     
-    state_map, _ = get_regime_state_by_date(lotteries, sorted_lots, date_wd, all_dates_sorted)
-    _, valid_2d_dates, daily_2d_map, _, _, _ = build_2d_streams_and_portfolio(lotteries)
+    state_map, latest_streak = get_regime_state_by_date(lotteries, sorted_lots, date_wd, all_dates_sorted)
+    mkt_ab_stream, valid_2d_dates, daily_2d_map, mult_alt_live, mult_boost_live, _ = build_2d_streams_and_portfolio(lotteries)
 
     chrono_days = []
-    mult_3d_all = 1
-    mult_3d_sow = 1
-    mult_3d_alt = 1
-    mult_3d_exp = 1
+    # แยกตัวคูณเดินเงิน 3D ระหว่าง วันจันทร์-ศุกร์ (wd_mult) และ วันเสาร์-อาทิตย์ (we_mult) ออกจากกัน 100%
+    wd_mult = {'all': 1, 'sow': 1, 'alt': 1, 'exp': 1}
+    we_mult = {'all': 1, 'sow': 1, 'alt': 1, 'exp': 1}
     
     for d_str in all_dates_sorted:
         dt = datetime.strptime(d_str, '%Y-%m-%d')
         is_weekend = dt.weekday() in [5, 6]
+        is_live_today = (d_str == today_str)
+        cur_m = we_mult if is_weekend else wd_mult
+
         if not is_weekend:
             targets = [
-                ('ฮั่งเส็งรอบเช้า', '🇭🇰 ฮั่งเส็งเช้า'),
-                ('หุ้นอังกฤษ', '🇬🇧 หุ้นอังกฤษ'),
-                ('หุ้นดาวโจนส์', '🇺🇸 หุ้นดาวโจนส์')
+                ('ฮั่งเส็งรอบเช้า', '🇭🇰 ฮั่งเส็งเช้า', '11:00 น.'),
+                ('หุ้นอังกฤษ', '🇬🇧 หุ้นอังกฤษ', '23:30 น.'),
+                ('หุ้นดาวโจนส์', '🇺🇸 หุ้นดาวโจนส์', '03:30 น.')
             ]
         else:
             targets = [
-                ('หวยเวียดนาม/ฮานอยพิเศษ', '🇻🇳 ฮานอยพิเศษ'),
-                ('หวยเวียดนาม/ฮานอย', '🇻🇳 ฮานอยปกติ'),
-                ('หวยลาว Super', '🇱🇦 ลาว Super'),
-                ('หวยเวียดนาม/ฮานอย VIP', '🇻🇳 ฮานอย VIP')
+                ('หวยเวียดนาม/ฮานอยพิเศษ', '🇻🇳 ฮานอยพิเศษ', '17:30 น.'),
+                ('หวยเวียดนาม/ฮานอย', '🇻🇳 ฮานอยปกติ', '18:30 น.'),
+                ('หวยลาว Super', '🇱🇦 ลาว Super', '19:00 น.'),
+                ('หวยเวียดนาม/ฮานอย VIP', '🇻🇳 ฮานอย VIP', '19:30 น.')
             ]
             
         hsi_today = lotteries.get('ฮั่งเส็งรอบเช้า', {}).get(d_str)
-        use_b_3d = state_map.get(d_str, {}).get('use_b', False)
-        prev_st_3d = state_map.get(d_str, {}).get('prev_lose_streak', 0)
+        if d_str in state_map:
+            use_b_3d = state_map[d_str]['use_b']
+            prev_st_3d = state_map[d_str]['prev_lose_streak']
+        else:
+            use_b_3d = (latest_streak == 2) and (not is_weekend)
+            prev_st_3d = latest_streak
         
         day_draws_3d = []
         total_bets_3d = 0
         total_payout_3d = 0
+        drawn_3d_count = 0
         
-        for key_name, display_name in targets:
+        for key_name, display_name, draw_time in targets:
             lot_data = lotteries.get(key_name, {})
-            if d_str not in lot_data:
-                continue
             m = compute_market_models(key_name, d_str, is_weekend, hsi_today, sorted_lots, date_wd)
             if not m:
                 continue
-                
-            actual = lot_data[d_str]
-            actual_top3 = actual['top3']
-            actual_2d = f"{actual['t']}{actual['u']}"
-            
             active_3d = m['b'] if use_b_3d else m['a']
-            hit_3d = (actual['h'] in active_3d['h']) and (actual['t'] in active_3d['t']) and (actual['u'] in active_3d['u'])
             bet_3d = active_3d['bet']
-            payout_3d = 850 if hit_3d else 0
-            total_bets_3d += bet_3d
-            total_payout_3d += payout_3d
-            
-            day_draws_3d.append({
-                'market': key_name,
-                'name': display_name,
-                'actual_top3': actual_top3,
-                'actual_bot2': actual['bot2'],
-                'actual_2d': actual_2d,
-                'hit_3d': hit_3d,
-                'bet_3d': bet_3d,
-                'payout_3d': payout_3d,
-                'use_b': use_b_3d
-            })
+
+            if d_str in lot_data:
+                actual = lot_data[d_str]
+                actual_top3 = actual['top3']
+                actual_2d = f"{actual['t']}{actual['u']}"
+                hit_3d = (actual['h'] in active_3d['h']) and (actual['t'] in active_3d['t']) and (actual['u'] in active_3d['u'])
+                payout_3d = 850 if hit_3d else 0
+                total_bets_3d += bet_3d
+                total_payout_3d += payout_3d
+                drawn_3d_count += 1
+                day_draws_3d.append({
+                    'market': key_name,
+                    'name': display_name,
+                    'draw_time': draw_time,
+                    'actual_top3': actual_top3,
+                    'actual_bot2': actual['bot2'],
+                    'actual_2d': actual_2d,
+                    'hit_3d': hit_3d,
+                    'bet_3d': bet_3d,
+                    'payout_3d': payout_3d,
+                    'use_b': use_b_3d,
+                    'is_pending': False
+                })
+            elif is_live_today:
+                day_draws_3d.append({
+                    'market': key_name,
+                    'name': display_name,
+                    'draw_time': draw_time,
+                    'actual_top3': None,
+                    'actual_bot2': None,
+                    'actual_2d': None,
+                    'hit_3d': None,
+                    'bet_3d': bet_3d,
+                    'payout_3d': 0,
+                    'use_b': use_b_3d,
+                    'is_pending': True
+                })
 
         day_2d_info = daily_2d_map.get(d_str)
+        backup_2d_drawn = []
+
+        if is_live_today and not is_weekend and not day_2d_info:
+            top4_today, backup_today = get_2d_picks_for_date(d_str, lotteries, mkt_ab_stream, mult_alt_live, mult_boost_live)
+            live_draws_2d = []
+            tot_c_1x = 0; tot_p_1x = 0
+            tot_c_alt = 0; tot_p_alt = 0
+            tot_c_boost = 0; tot_p_boost = 0
+            tot_c_2x = 0; tot_p_2x = 0
+            w_cnt = 0
+            drawn_2d_cnt = 0
+            for it in top4_today:
+                c = it['nums_count']
+                m_1x = 1
+                m_alt = it['m_alt']
+                m_boost = it['m_boost']
+                m_2x = it['m_alt']
+                if it['actual_top3'] is not None:
+                    drawn_2d_cnt += 1
+                    w = 1 if it['hit'] else 0
+                    if w: w_cnt += 1
+                    base_net = (PAY2 - c) if w else -c
+                    p_1x = base_net * m_1x
+                    p_alt = base_net * m_alt
+                    p_boost = base_net * m_boost
+                    p_2x = base_net * m_2x
+                    tot_c_1x += c * m_1x; tot_p_1x += p_1x
+                    tot_c_alt += c * m_alt; tot_p_alt += p_alt
+                    tot_c_boost += c * m_boost; tot_p_boost += p_boost
+                    tot_c_2x += c * m_2x; tot_p_2x += p_2x
+                    is_pend = False
+                else:
+                    p_1x = 0; p_alt = 0; p_boost = 0; p_2x = 0
+                    is_pend = True
+
+                live_draws_2d.append({
+                    'rank': it['rank'],
+                    'score': it['score'],
+                    'hits5_str': it['hits5_str'],
+                    'pnl5': it['pnl5'],
+                    'title': it['title'],
+                    'market': it['lottery_key'],
+                    'name': it['name'],
+                    'short_name': it['short_name'],
+                    'draw_time': it['draw_time'],
+                    'tag': it['tag'],
+                    'use_b': it['use_formula_b'],
+                    'formula_name': it['formula_label'],
+                    'target': it['target'],
+                    'target_thai': it['target_thai'],
+                    'method_short': it['method_short'],
+                    'detail_text': it['detail_text'],
+                    'root_digits': it['root_digits'],
+                    'tens': it['tens'],
+                    'units': it['units'],
+                    'nums_count': c,
+                    'actual_top3': it['actual_top3'],
+                    'actual_bot2': it['actual_bot2'],
+                    'actual_target': it['actual_target'],
+                    'hit': it['hit'],
+                    'is_pending': is_pend,
+                    'm_1x': m_1x, 'm_alt': m_alt, 'm_boost': m_boost, 'm_2x': m_2x,
+                    'cost_1x': c * m_1x if not is_pend else 0, 'pnl_1x': p_1x,
+                    'cost_alt': c * m_alt if not is_pend else 0, 'pnl_alt': p_alt,
+                    'cost_boost': c * m_boost if not is_pend else 0, 'pnl_boost': p_boost,
+                    'cost_2x': c * m_2x if not is_pend else 0, 'pnl_2x': p_2x,
+                })
+            for bk in backup_today:
+                if bk['actual_top3'] is not None:
+                    backup_2d_drawn.append({
+                        'rank': bk['rank'],
+                        'name': bk['name'],
+                        'draw_time': bk['draw_time'],
+                        'method_short': bk['method_short'],
+                        'target_thai': bk['target_thai'],
+                        'actual_top3': bk['actual_top3'],
+                        'actual_bot2': bk['actual_bot2'],
+                        'hit': bk['hit'],
+                        'use_b': bk['use_formula_b'],
+                    })
+            day_2d_info = {
+                'date': d_str,
+                'draws': live_draws_2d,
+                'draws_count': drawn_2d_cnt,
+                'planned_count': len(live_draws_2d),
+                'wins_count': w_cnt,
+                'any_b': any(dr['use_b'] for dr in live_draws_2d),
+                'cost_1x': tot_c_1x, 'pnl_1x': tot_p_1x,
+                'cost_alt': tot_c_alt, 'pnl_alt': tot_p_alt,
+                'cost_boost': tot_c_boost, 'pnl_boost': tot_p_boost,
+                'cost_2x': tot_c_2x, 'pnl_2x': tot_p_2x,
+                'sow_cost_1x': tot_c_1x, 'sow_pnl_1x': tot_p_1x,
+                'sow_cost_2x': tot_c_boost, 'sow_pnl_2x': tot_p_boost,
+            }
+
         if not day_draws_3d and not day_2d_info:
             continue
 
-        # 3D calculations
+        # 3D calculations (only across completed draws of the day)
         sow_bets_3d, sow_payout_3d = 0, 0
         for d in day_draws_3d:
+            if d.get('is_pending'):
+                continue
             sow_bets_3d += d['bet_3d']
             if d['hit_3d']:
                 sow_payout_3d += d['payout_3d']
@@ -1004,16 +1257,17 @@ def generate_history_data():
 
         prof_3d_1x = total_payout_3d - total_bets_3d
         prof_3d_sow_1x = sow_payout_3d - sow_bets_3d
-        prof_3d_2x = prof_3d_1x * mult_3d_all
-        prof_3d_alt = prof_3d_1x * mult_3d_alt
-        prof_3d_exp = prof_3d_1x * mult_3d_exp
-        prof_3d_sow_2x = prof_3d_sow_1x * mult_3d_sow
+        prof_3d_2x = prof_3d_1x * cur_m['all']
+        prof_3d_alt = prof_3d_1x * cur_m['alt']
+        prof_3d_exp = prof_3d_1x * cur_m['exp']
+        prof_3d_sow_2x = prof_3d_sow_1x * cur_m['sow']
 
         # 2D Top 4 Hot Markets calculations
         if day_2d_info:
             draws_2d = day_2d_info['draws']
             wins_2d = day_2d_info['wins_count']
             bets_2d_count = day_2d_info['draws_count']
+            planned_2d_count = day_2d_info.get('planned_count', bets_2d_count)
             any_b_2d = day_2d_info['any_b']
             cost_2d_1x = day_2d_info['cost_1x']; prof_2d_1x = day_2d_info['pnl_1x']
             cost_2d_alt = day_2d_info['cost_alt']; prof_2d_alt = day_2d_info['pnl_alt']
@@ -1023,7 +1277,7 @@ def generate_history_data():
             sow_cost_2d_2x = day_2d_info['sow_cost_2x']; sow_prof_2d_2x = day_2d_info['sow_pnl_2x']
         else:
             draws_2d = []
-            wins_2d = 0; bets_2d_count = 0; any_b_2d = False
+            wins_2d = 0; bets_2d_count = 0; planned_2d_count = 0; any_b_2d = False
             cost_2d_1x = 0; prof_2d_1x = 0
             cost_2d_alt = 0; prof_2d_alt = 0
             cost_2d_boost = 0; prof_2d_boost = 0
@@ -1037,18 +1291,23 @@ def generate_history_data():
             'raw_date': f"{dt.day:02d}/{dt.month:02d}/{str(dt.year)[-2:]}",
             'day_name': f"วัน{day_thai_name}",
             'is_weekend': is_weekend,
+            'is_live_today': is_live_today,
+            'today_drawn_all': get_today_drawn_summary(lotteries, d_str) if is_live_today else [],
+            'backup_2d_drawn': backup_2d_drawn,
             'use_b': use_b_3d,
             'any_b_2d': any_b_2d,
             'prev_lose_streak': prev_st_3d,
-            'mult_3d_all': mult_3d_all,
-            'mult_3d_alt': mult_3d_alt,
-            'mult_3d_exp': mult_3d_exp,
-            'mult_3d_sow': mult_3d_sow,
-            'draws_count': len(day_draws_3d),
+            'mult_3d_all': cur_m['all'],
+            'mult_3d_alt': cur_m['alt'],
+            'mult_3d_exp': cur_m['exp'],
+            'mult_3d_sow': cur_m['sow'],
+            'draws_count': drawn_3d_count,
+            'planned_3d_count': len(day_draws_3d),
             'draws': day_draws_3d,
             'draws_2d': draws_2d,
             'wins_2d': wins_2d,
             'bets_2d_count': bets_2d_count,
+            'planned_2d_count': planned_2d_count,
             # 2D Top 4 Hot Markets (mapped to _19d keys for seamless UI compatibility + boost mode)
             'bets_19d': cost_2d_1x,
             'profit_19d': prof_2d_1x,
@@ -1072,30 +1331,31 @@ def generate_history_data():
             'profit_3d_alt': prof_3d_alt,
             'profit_3d_boost': prof_3d_alt,
             'profit_3d_exp': prof_3d_exp,
-            'bets_3d_2x': total_bets_3d * mult_3d_all,
-            'bets_3d_alt': total_bets_3d * mult_3d_alt,
-            'bets_3d_boost': total_bets_3d * mult_3d_alt,
-            'bets_3d_exp': total_bets_3d * mult_3d_exp,
+            'bets_3d_2x': total_bets_3d * cur_m['all'],
+            'bets_3d_alt': total_bets_3d * cur_m['alt'],
+            'bets_3d_boost': total_bets_3d * cur_m['alt'],
+            'bets_3d_exp': total_bets_3d * cur_m['exp'],
             'sow_bets_3d': sow_bets_3d,
             'sow_profit_3d': prof_3d_sow_1x,
             'sow_profit_3d_2x': prof_3d_sow_2x,
-            'sow_bets_3d_2x': sow_bets_3d * mult_3d_sow,
+            'sow_bets_3d_2x': sow_bets_3d * cur_m['sow'],
         })
         
-        if day_draws_3d:
-            mult_3d_all = 2 if prof_3d_1x > 0 else 1
-            mult_3d_alt = (2 if mult_3d_alt == 1 else 1) if prof_3d_1x > 0 else 1
-            mult_3d_exp = (mult_3d_exp * 2) if prof_3d_1x > 0 else 1
-            mult_3d_sow = 2 if prof_3d_sow_1x > 0 else 1
+        if drawn_3d_count > 0 and not is_live_today:
+            cur_m['all'] = 2 if prof_3d_1x > 0 else 1
+            cur_m['alt'] = (2 if cur_m['alt'] == 1 else 1) if prof_3d_1x > 0 else 1
+            cur_m['exp'] = (cur_m['exp'] * 2) if prof_3d_1x > 0 else 1
+            cur_m['sow'] = 2 if prof_3d_sow_1x > 0 else 1
 
     history_days = list(reversed(chrono_days))
+    completed_days = [h for h in history_days if not h.get('is_live_today')]
     total_days = len(history_days)
     total_2d_days = len(valid_2d_dates)
-    win_days_19d = sum(1 for h in history_days if h['bets_2d_count'] > 0 and h['profit_19d_boost'] > 0)
-    win_days_3d = sum(1 for h in history_days if h['draws_count'] > 0 and h['profit_3d'] > 0)
-    total_draws_2d = sum(h['bets_2d_count'] for h in history_days)
-    total_hits_2d = sum(h['wins_2d'] for h in history_days)
-    total_hits_3d = sum(sum(1 for d in h['draws'] if d['hit_3d']) for h in history_days)
+    win_days_19d = sum(1 for h in completed_days if h['bets_2d_count'] > 0 and h['profit_19d_boost'] > 0)
+    win_days_3d = sum(1 for h in completed_days if h['draws_count'] > 0 and h['profit_3d'] > 0)
+    total_draws_2d = sum(h['bets_2d_count'] for h in completed_days)
+    total_hits_2d = sum(h['wins_2d'] for h in completed_days)
+    total_hits_3d = sum(sum(1 for d in h['draws'] if d['hit_3d']) for h in completed_days)
     
     stats_summary = {
         'total_days': total_days,
@@ -1105,23 +1365,34 @@ def generate_history_data():
         'total_draws_2d': total_draws_2d,
         'total_hits_2d': total_hits_2d,
         'total_hits_3d': total_hits_3d,
+        'thai_today': today_str,
+        'thai_now': get_thai_now().strftime('%d/%m/%Y %H:%M:%S น.')
     }
     
     return history_days, stats_summary
 
-@app.route('/api/picks')
-def api_picks():
-    target_d = request.args.get('date')
-    picks_3d, picks_2d_top4, picks_2d_backup, is_weekend, use_formula_b, prev_streak = calculate_picks(target_d)
-    return jsonify({
+def build_picks_payload(target_d=None):
+    picks_3d, picks_2d_top4, picks_2d_backup, is_weekend, use_formula_b, prev_streak, today_drawn, date_str = calculate_picks(target_d)
+    dt = datetime.strptime(date_str, '%Y-%m-%d')
+    day_thai_name = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"][dt.weekday()]
+    return {
         'picks': picks_3d,
         'picks_2d_top4': picks_2d_top4,
         'picks_2d_backup': picks_2d_backup,
         'is_weekend': is_weekend,
         'use_formula_b': use_formula_b,
         'prev_lose_streak': prev_streak,
-        'date': target_d or date.today().strftime('%Y-%m-%d')
-    })
+        'today_drawn': today_drawn,
+        'date': date_str,
+        'raw_date': f"{dt.day:02d}/{dt.month:02d}/{str(dt.year)[-2:]}",
+        'day_name': f"วัน{day_thai_name}",
+        'thai_now': get_thai_now().strftime('%d/%m/%Y %H:%M:%S น.')
+    }
+
+@app.route('/api/picks')
+def api_picks():
+    target_d = request.args.get('date')
+    return jsonify(build_picks_payload(target_d))
 
 @app.route('/api/history')
 def api_history():
@@ -1134,10 +1405,17 @@ def api_history():
 @app.route('/api/sync', methods=['POST'])
 def api_sync():
     logs = sync_yahoo_finance()
+    picks_payload = build_picks_payload()
+    history_days, stats_summary = generate_history_data()
     return jsonify({
         'status': 'success', 
         'logs': logs, 
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        'timestamp': get_thai_now().strftime('%Y-%m-%d %H:%M:%S'),
+        'picks_payload': picks_payload,
+        'history_payload': {
+            'history': history_days,
+            'stats': stats_summary
+        }
     })
 
 @app.route('/')
@@ -1237,6 +1515,18 @@ HTML_TEMPLATE = """
                 </span>
             </div>
 
+            <!-- Live Today Drawn Markets Banner -->
+            <div id="todayDrawnBanner" class="glass rounded-2xl p-3 border border-teal-500/40 bg-slate-900/80 space-y-1.5 hidden">
+                <div class="flex items-center justify-between text-[11px]">
+                    <span class="font-extrabold text-teal-300 flex items-center gap-1.5">
+                        <span class="w-2 h-2 rounded-full bg-teal-400 animate-ping"></span>
+                        <span id="todayDrawnTitle">ผลหวยที่ออกแล้ววันนี้</span>
+                    </span>
+                    <span class="text-[10px] text-gray-400" id="thaiClockText">เวลาไทย: -</span>
+                </div>
+                <div id="todayDrawnList" class="flex flex-wrap gap-1.5 pt-0.5"></div>
+            </div>
+
             <div id="picksLoading" class="py-16 text-center text-gray-400 space-y-2">
                 <i class="fa-solid fa-circle-notch fa-spin text-3xl text-emerald-400"></i>
                 <p class="text-xs font-medium">กำลังคำนวณสูตร 2D คัด 4 ตลาดฮอต & 3D Cube Sniper...</p>
@@ -1263,7 +1553,7 @@ HTML_TEMPLATE = """
                 <div class="pt-1">
                     <button onclick="toggleBackup2d()" id="btnToggleBackup2d" class="w-full py-2 px-3 rounded-xl bg-slate-900/80 border border-slate-700 text-gray-400 text-xs font-semibold flex items-center justify-center gap-2 hover:text-white transition">
                         <i class="fa-solid fa-chevron-down" id="iconBackup2d"></i>
-                        <span>ดูอีก 4 ตลาดสำรอง (กรณีต้องการแทงครบ 8 ตลาด)</span>
+                        <span id="btnToggleBackup2dText">ดูอีก 4 ตลาดสำรอง (กรณีต้องการแทงครบ 8 ตลาด)</span>
                     </button>
                     <div id="picks2dBackupContainer" class="space-y-3 mt-3 hidden"></div>
                 </div>
@@ -1286,11 +1576,21 @@ HTML_TEMPLATE = """
                     <h2 class="text-lg font-black text-white flex items-center gap-2">
                         <i class="fa-solid fa-square-check text-teal-400"></i> ตรวจผล ถูก / ผิด & กำไรทุกวัน
                     </h2>
-                    <p class="text-xs text-gray-400">2D คัด 4 ตลาดฮอต (+สูตร B วันที่ 3) & 3D Cube Sniper</p>
+                    <p class="text-xs text-gray-400" id="resSubHeader">แยกวันจันทร์–ศุกร์ (หวยหุ้น) และ เสาร์–อาทิตย์ (หวยวันหยุด)</p>
                 </div>
                 <span class="px-2.5 py-1 text-[11px] font-bold rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30" id="resTotalDays">
                     - วัน
                 </span>
+            </div>
+
+            <!-- Day-Group Switcher: แยกวัน จันทร์-ศุกร์ vs เสาร์-อาทิตย์ ออกจากกัน 100% -->
+            <div class="glass p-2 rounded-2xl border border-teal-500/40 bg-slate-900/90 grid grid-cols-2 gap-2 shadow-lg">
+                <button onclick="setDayGroup('wd')" id="btnDayWd" class="py-2.5 px-2 rounded-xl text-xs font-extrabold border transition flex items-center justify-center gap-1.5 bg-emerald-500/25 text-emerald-300 border-emerald-400/50 shadow">
+                    💼 จันทร์ – ศุกร์ (หวยหุ้น)
+                </button>
+                <button onclick="setDayGroup('we')" id="btnDayWe" class="py-2.5 px-2 rounded-xl text-xs font-bold border transition flex items-center justify-center gap-1.5 bg-slate-900/60 text-gray-400 border-slate-700">
+                    🌴 เสาร์ – อาทิตย์ (วันหยุด)
+                </button>
             </div>
 
             <!-- Staking & Play Mode Selector -->
@@ -1326,41 +1626,41 @@ HTML_TEMPLATE = """
             <!-- Quick Summary Card -->
             <div class="glass rounded-2xl p-4 border border-emerald-500/30 bg-gradient-to-br from-darkCard to-slate-900 shadow-xl space-y-3">
                 <div class="flex justify-between items-center border-b border-darkBorder/60 pb-2.5">
-                    <span class="text-xs font-bold text-gray-300 flex items-center gap-1.5">
-                        <i class="fa-solid fa-fire text-amber-400"></i> ผลตอบแทนสะสมย้อนหลัง (75 วันทำการ)
+                    <span class="text-xs font-bold text-gray-300 flex items-center gap-1.5" id="summaryCardTitle">
+                        <i class="fa-solid fa-fire text-amber-400"></i> ผลตอบแทนสะสม (วันจันทร์ – ศุกร์)
                     </span>
                     <span class="text-[11px] font-bold text-emerald-400" id="cardRoiText">ความแม่น 2D: 146/300 ไม้ (48.7%)</span>
                 </div>
-                <div class="grid grid-cols-2 gap-2.5 text-center">
-                    <div class="p-2.5 rounded-xl bg-slate-900/60 border border-emerald-500/30">
+                <div class="grid grid-cols-2 gap-2.5 text-center" id="summaryGrid2Cols">
+                    <div class="p-2.5 rounded-xl bg-slate-900/60 border border-emerald-500/30" id="summaryBox2d">
                         <p class="text-[10px] text-gray-400">🔥 2 ตัว (คัด 4 ตลาด/วัน)</p>
                         <p class="text-base font-extrabold text-emerald-400 mt-0.5" id="cardProfit19d">+0 ฿</p>
                     </div>
-                    <div class="p-2.5 rounded-xl bg-slate-900/60 border border-orange-500/30">
-                        <p class="text-[10px] text-gray-400">🎯 3D Cube Sniper (+สูตร B)</p>
+                    <div class="p-2.5 rounded-xl bg-slate-900/60 border border-orange-500/30" id="summaryBox3d">
+                        <p class="text-[10px] text-gray-400" id="labelProfit3d">🎯 3 ตัวบน (สูตร A + สลับ B วันที่ 3)</p>
                         <p class="text-base font-extrabold text-orange-400 mt-0.5" id="cardProfit3d">+0 ฿</p>
                     </div>
                 </div>
                 <div class="p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex justify-between items-center mt-2">
-                    <span class="text-xs text-emerald-400 font-medium">กำไรสุทธิรวมตามสูตรที่เลือก</span>
+                    <span class="text-xs text-emerald-400 font-medium" id="labelTotalProfitAll">กำไรสุทธิรวมตามสูตรที่เลือก (จ–ศ)</span>
                     <span class="text-lg font-black text-emerald-400" id="cardTotalProfitAll">+0 ฿</span>
                 </div>
             </div>
             
-            <!-- Model Selection Filter Control Bar -->
-            <div class="glass p-3.5 rounded-2xl border border-darkBorder bg-darkCard/80 space-y-2">
+            <!-- Model Selection Filter Control Bar (shown on Mon-Fri) -->
+            <div id="modelFilterBox" class="glass p-3.5 rounded-2xl border border-darkBorder bg-darkCard/80 space-y-2">
                 <div class="flex justify-between items-center text-xs">
                     <span class="font-extrabold text-gray-200 flex items-center gap-1.5">
-                        <i class="fa-solid fa-sliders text-teal-400"></i> เลือกแสดงผลสูตร:
+                        <i class="fa-solid fa-sliders text-teal-400"></i> เลือกแสดงผลสูตร (กดเปิด/ปิดแยกดูได้):
                     </span>
-                    <span class="text-[10px] text-emerald-400 font-bold" id="filterStatusText">เฉพาะ: 2 ตัว (คัด 4 ตลาด/วัน)</span>
+                    <span class="text-[10px] text-emerald-400 font-bold" id="filterStatusText">รวมทั้ง 2 สูตรหลัก</span>
                 </div>
                 <div class="grid grid-cols-2 gap-2">
                     <button onclick="toggleModelFilter('19d')" id="btnFilter19d" class="py-2 px-2 rounded-xl text-xs font-bold border transition flex items-center justify-center gap-1.5 bg-emerald-500/20 text-emerald-300 border-emerald-500/40 active:scale-95">
                         <i class="fa-solid fa-square-check" id="iconFilter19d"></i> 🔥 2 ตัว (คัด 4 ตลาด)
                     </button>
-                    <button onclick="toggleModelFilter('3d')" id="btnFilter3d" class="py-2 px-2 rounded-xl text-xs font-bold border transition flex items-center justify-center gap-1.5 bg-slate-900/60 text-gray-500 border-slate-700 active:scale-95">
-                        <i class="fa-regular fa-square" id="iconFilter3d"></i> 🎯 3 ตัว Cube Sniper
+                    <button onclick="toggleModelFilter('3d')" id="btnFilter3d" class="py-2 px-2 rounded-xl text-xs font-bold border transition flex items-center justify-center gap-1.5 bg-orange-500/20 text-orange-300 border-orange-500/40 active:scale-95">
+                        <i class="fa-solid fa-square-check" id="iconFilter3d"></i> 🎯 3 ตัว (สูตร A+B)
                     </button>
                 </div>
             </div>
@@ -1368,7 +1668,7 @@ HTML_TEMPLATE = """
             <!-- Cumulative Profit Chart -->
             <div class="glass rounded-2xl p-4 border border-darkBorder shadow-xl bg-darkCard/50">
                 <div class="flex justify-between items-center mb-2">
-                    <span class="text-xs font-bold text-gray-300"><i class="fa-solid fa-chart-area text-blue-400"></i> กราฟกำไรสะสมรายวัน (Cumulative PnL)</span>
+                    <span class="text-xs font-bold text-gray-300" id="chartTitleText"><i class="fa-solid fa-chart-area text-blue-400"></i> กราฟกำไรสะสมรายวัน (จันทร์ – ศุกร์)</span>
                 </div>
                 <div class="relative h-48 w-full">
                     <canvas id="profitChart"></canvas>
@@ -1390,14 +1690,14 @@ HTML_TEMPLATE = """
         <section id="tabStats" class="space-y-4 hidden">
             <div>
                 <h2 class="text-lg font-black text-white flex items-center gap-2">
-                    <i class="fa-solid fa-chart-pie text-emerald-400"></i> สถิติ & ประสิทธิภาพพอร์ต
+                    <i class="fa-solid fa-chart-pie text-emerald-400"></i> สถิติ & ประสิทธิภาพพอร์ต (แยก จ-ศ / ส-อา)
                 </h2>
-                <p class="text-xs text-gray-400">สรุปสถิติสูตร 2 ตัว คัด 4 ตลาด/วัน (75 วันทำการ) & 3D Cube Sniper</p>
+                <p class="text-xs text-gray-400">สรุปสถิติแยกวันจันทร์–ศุกร์ (หวยหุ้น) และ วันเสาร์–อาทิตย์ (หวยวันหยุด)</p>
             </div>
 
             <div class="glass rounded-2xl p-4 border border-emerald-500/30 space-y-3">
                 <h3 class="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
-                    <i class="fa-solid fa-fire"></i> สรุปสูตร 2 ตัว (คัดมาแทงแค่ 4 ตลาด/วัน + สลับสูตร B วันที่ 3)
+                    <i class="fa-solid fa-fire"></i> 💼 วันจันทร์ – ศุกร์: สูตร 2 ตัว (คัด 4 ตลาดฮอต/วัน + สลับสูตร B วันที่ 3)
                 </h3>
                 <div class="space-y-2 text-xs">
                     <div class="flex justify-between py-1 border-b border-darkBorder/40">
@@ -1425,23 +1725,23 @@ HTML_TEMPLATE = """
 
             <div class="glass rounded-2xl p-4 border border-darkBorder space-y-3">
                 <h3 class="text-xs font-bold text-teal-300 flex items-center gap-1.5">
-                    <i class="fa-solid fa-briefcase"></i> สถิติตามโหมดและสูตรที่เลือกในปัจจุบัน
+                    <i class="fa-solid fa-briefcase"></i> สรุปแยกพอร์ต จันทร์–ศุกร์ vs เสาร์–อาทิตย์ (ตามโหมดที่เลือก)
                 </h3>
                 <div class="space-y-2 text-xs">
                     <div class="flex justify-between py-1 border-b border-darkBorder/40">
-                        <span class="text-gray-400">วันจันทร์ - ศุกร์ (ตลาดหุ้น)</span>
+                        <span class="text-gray-400">💼 วันจันทร์ – ศุกร์ (หวยหุ้น)</span>
                         <span class="font-bold text-white" id="statWdWinLoss">-</span>
                     </div>
                     <div class="flex justify-between py-1 border-b border-darkBorder/40">
-                        <span class="text-gray-400">กำไรสุทธิ จันทร์ - ศุกร์</span>
+                        <span class="text-gray-400">กำไรสุทธิ จันทร์ – ศุกร์</span>
                         <span class="font-bold text-emerald-400" id="statWdProfit">-</span>
                     </div>
                     <div class="flex justify-between py-1 border-b border-darkBorder/40">
-                        <span class="text-gray-400">วันเสาร์ - อาทิตย์ (เฉพาะ 3D)</span>
+                        <span class="text-gray-400">🌴 วันเสาร์ – อาทิตย์ (หวยวันหยุด 3D)</span>
                         <span class="font-bold text-white" id="statWeWinLoss">-</span>
                     </div>
                     <div class="flex justify-between pt-1 font-bold text-sm">
-                        <span class="text-gray-300">กำไรสุทธิ เสาร์ - อาทิตย์</span>
+                        <span class="text-gray-300">กำไรสุทธิ เสาร์ – อาทิตย์</span>
                         <span class="text-emerald-400" id="statWeProfit">-</span>
                     </div>
                 </div>
@@ -1470,9 +1770,9 @@ HTML_TEMPLATE = """
         let currentTab = 'picks';
         let historyData = null;
         let profitChartInstance = null;
-        // Default to showing the 2D Top 4 Hot Markets model first so the user immediately sees the +4,940 / +4,001 / +3,091 daily PnL!
-        let selectedModels = { '19d': true, '3d': false };
+        let selectedModels = { '19d': true, '3d': true };
         let playMode = 'boost_b'; // 'boost_b', 'all_alt', 'all_1x', 'all_2x', 'sow_1x', 'sow_2x'
+        let dayGroup = 'wd'; // 'wd' = จันทร์-ศุกร์ (หวยหุ้น), 'we' = เสาร์-อาทิตย์ (หวยวันหยุด)
         let showBackup2d = false;
 
         function switchTab(tab) {
@@ -1493,12 +1793,46 @@ HTML_TEMPLATE = """
                 document.getElementById('tabResults').classList.remove('hidden');
                 document.getElementById('navResults').classList.add('active-tab-nav');
                 if (!historyData) loadHistory();
+                else renderFilteredHistory();
             } else if (tab === 'stats') {
                 document.getElementById('tabStats').classList.remove('hidden');
                 document.getElementById('navStats').classList.add('active-tab-nav');
                 if (!historyData) loadHistory();
+                else renderFilteredHistory();
             }
             window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        function setDayGroup(group) {
+            dayGroup = group;
+            const btnWd = document.getElementById('btnDayWd');
+            const btnWe = document.getElementById('btnDayWe');
+            const modelBox = document.getElementById('modelFilterBox');
+            const box2d = document.getElementById('summaryBox2d');
+            const grid2Cols = document.getElementById('summaryGrid2Cols');
+
+            if (group === 'wd') {
+                btnWd.className = 'py-2.5 px-2 rounded-xl text-xs font-extrabold border transition flex items-center justify-center gap-1.5 bg-emerald-500/25 text-emerald-300 border-emerald-400/50 shadow';
+                btnWe.className = 'py-2.5 px-2 rounded-xl text-xs font-bold border transition flex items-center justify-center gap-1.5 bg-slate-900/60 text-gray-400 border-slate-700';
+                modelBox.classList.remove('hidden');
+                box2d.classList.remove('hidden');
+                grid2Cols.className = 'grid grid-cols-2 gap-2.5 text-center';
+                document.getElementById('summaryCardTitle').innerHTML = '<i class="fa-solid fa-fire text-amber-400"></i> ผลตอบแทนสะสม (วันจันทร์ – ศุกร์: หวยหุ้น)';
+                document.getElementById('labelProfit3d').innerText = '🎯 3 ตัวบน (สูตร A + สลับ B วันที่ 3)';
+                document.getElementById('labelTotalProfitAll').innerText = 'กำไรสุทธิรวมตามสูตรที่เลือก (จันทร์ – ศุกร์)';
+                document.getElementById('chartTitleText').innerHTML = '<i class="fa-solid fa-chart-area text-blue-400"></i> กราฟกำไรสะสมรายวัน (วันจันทร์ – ศุกร์)';
+            } else {
+                btnWe.className = 'py-2.5 px-2 rounded-xl text-xs font-extrabold border transition flex items-center justify-center gap-1.5 bg-amber-500/25 text-amber-300 border-amber-400/50 shadow';
+                btnWd.className = 'py-2.5 px-2 rounded-xl text-xs font-bold border transition flex items-center justify-center gap-1.5 bg-slate-900/60 text-gray-400 border-slate-700';
+                modelBox.classList.add('hidden');
+                box2d.classList.add('hidden');
+                grid2Cols.className = 'grid grid-cols-1 gap-2.5 text-center';
+                document.getElementById('summaryCardTitle').innerHTML = '<i class="fa-solid fa-umbrella-beach text-amber-400"></i> ผลตอบแทนสะสม (วันเสาร์ – อาทิตย์: หวยวันหยุด)';
+                document.getElementById('labelProfit3d').innerText = '🎯 3 ตัวบน หวยวันหยุด (ฮานอยพิเศษ/ปกติ/VIP & ลาว Super)';
+                document.getElementById('labelTotalProfitAll').innerText = 'กำไรสุทธิรวม (วันเสาร์ – อาทิตย์)';
+                document.getElementById('chartTitleText').innerHTML = '<i class="fa-solid fa-chart-area text-amber-400"></i> กราฟกำไรสะสมรายวัน (วันเสาร์ – อาทิตย์)';
+            }
+            if (historyData) renderFilteredHistory();
         }
 
         function toggleBackup2d() {
@@ -1591,7 +1925,7 @@ HTML_TEMPLATE = """
                 const hitIcon = it.hit ? '✅ เข้า!' : '❌ หลุด';
                 statusRight = `<span class="text-[11px] font-extrabold ${hitCls} border px-2.5 py-0.5 rounded-full">${hitIcon} บน:${it.actual_top3} | ล่าง:${it.actual_bot2}</span>`;
             } else {
-                statusRight = `<span class="text-[10px] font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded-full">คะแนนฮอต ${it.score} (5งวด: ${it.hits5_str})</span>`;
+                statusRight = `<span class="text-[10px] font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded-full">⏳ รอผล ${it.draw_time} (ฮอต ${it.score})</span>`;
             }
 
             let numbersDetailHtml = '';
@@ -1665,118 +1999,162 @@ HTML_TEMPLATE = """
             `;
         }
 
+        function renderPicksData(data) {
+            document.getElementById('picksDateHeader').innerText = `งวด${data.day_name || ''}ที่ ${data.raw_date || data.date} (${data.date})`;
+            document.getElementById('marketBadge').innerText = data.is_weekend ? '🌴 หวยวันหยุด (ส-อา)' : '💼 ตลาดหุ้นหลัก (จ-ศ)';
+
+            // Render Live Today Drawn Banner
+            const drawnBanner = document.getElementById('todayDrawnBanner');
+            const drawnList = document.getElementById('todayDrawnList');
+            const clockText = document.getElementById('thaiClockText');
+            const drawnTitle = document.getElementById('todayDrawnTitle');
+            if (drawnBanner && drawnList) {
+                drawnBanner.classList.remove('hidden');
+                if (clockText) clockText.innerText = `อัปเดต: ${data.thai_now || ''}`;
+                const td = data.today_drawn || [];
+                drawnTitle.innerText = `📡 ผลหวยวันนี้ (${data.raw_date || data.date}) ออกแล้ว ${td.length} ตลาด`;
+                if (td.length > 0) {
+                    drawnList.innerHTML = td.map(x => `
+                        <span class="px-2 py-0.5 rounded-lg bg-slate-800/90 border border-teal-500/30 text-[10px] text-gray-200">
+                            <b>${x.label}</b>: <span class="text-emerald-300 font-bold">${x.top3}</span>|<span class="text-amber-300 font-bold">${x.bot2}</span>
+                        </span>
+                    `).join('');
+                } else {
+                    drawnList.innerHTML = `<span class="text-[11px] text-gray-400">⏳ วันนี้ยังไม่มีตลาดที่ออกผล (ตลาดแรก นิเคอิเช้า 09:30 น.)</span>`;
+                }
+            }
+
+            // Render 2D Top 4 Hot Markets section
+            const sec2d = document.getElementById('picks2dSection');
+            const cont2d = document.getElementById('picks2dContainer');
+            const back2d = document.getElementById('picks2dBackupContainer');
+            cont2d.innerHTML = '';
+            back2d.innerHTML = '';
+
+            if (data.picks_2d_top4 && data.picks_2d_top4.length > 0 && !data.is_weekend) {
+                sec2d.classList.remove('hidden');
+                let sum1x = 0, sumAlt = 0, sumBoost = 0;
+                data.picks_2d_top4.forEach(it => {
+                    sum1x += it.cost_1x;
+                    sumAlt += it.cost_alt;
+                    sumBoost += it.cost_boost;
+                    cont2d.insertAdjacentHTML('beforeend', build2dCardHtml(it, false));
+                });
+                let bkDrawnCount = 0;
+                (data.picks_2d_backup || []).forEach(it => {
+                    if (it.actual_top3) bkDrawnCount++;
+                    back2d.insertAdjacentHTML('beforeend', build2dCardHtml(it, true));
+                });
+                const btnBkTxt = document.getElementById('btnToggleBackup2dText');
+                if (btnBkTxt) {
+                    btnBkTxt.innerText = bkDrawnCount > 0
+                        ? `ดูอีก 4 ตลาดสำรอง (ออกผลแล้ว ${bkDrawnCount} ตลาด)`
+                        : `ดูอีก 4 ตลาดสำรอง (กรณีต้องการแทงครบ 8 ตลาด)`;
+                }
+                document.getElementById('picks2dSummaryText').innerHTML = `
+                    วันนี้คัด 4 ตลาดฮอต: <b class="text-emerald-300">${data.picks_2d_top4.map(x => x.short_name).join(', ')}</b><br>
+                    ทุนรวมวันนี้: คงที่ 1x = <b>${sum1x}฿</b> | สลับ 1x↔2x = <b class="text-emerald-300">${sumAlt}฿</b> | อัดสูตร B 2x = <b class="text-amber-300">${sumBoost}฿</b>
+                `;
+            } else {
+                sec2d.classList.add('hidden');
+            }
+            
+            // Render 3D Cube Sniper section
+            const sec3d = document.getElementById('picks3dSection');
+            sec3d.classList.remove('hidden');
+            const banner = document.getElementById('regimeBanner');
+            if (data.use_formula_b) {
+                banner.className = 'glass rounded-2xl p-3 border border-purple-500/50 bg-gradient-to-r from-purple-500/20 to-slate-900';
+                banner.innerHTML = `
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center gap-2">
+                            <span class="px-2 py-0.5 rounded-lg bg-purple-500/30 text-purple-200 font-extrabold text-xs border border-purple-400/40">🔄 3D สูตร B ทำงานอัตโนมัติ</span>
+                            <span class="text-xs text-purple-200 font-semibold">โหมดแก้ทางวันที่ 3 (Mid-Cool 5×5×6)</span>
+                        </div>
+                        <span class="text-[10px] text-purple-300">สถิติเข้า 7/7 (100%)</span>
+                    </div>
+                `;
+            } else {
+                banner.className = 'glass rounded-2xl p-3 border border-orange-500/40 bg-gradient-to-r from-orange-500/10 to-slate-900';
+                banner.innerHTML = `
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center gap-2">
+                            <span class="px-2 py-0.5 rounded-lg bg-orange-500/20 text-orange-300 font-extrabold text-xs border border-orange-500/40">🎯 หวย 3 ตัวบน (สูตร A)</span>
+                            <span class="text-xs text-gray-200 font-semibold">3D Cube Sniper (${data.is_weekend ? '4×3×10 = 120 ตัว' : '5×5×6 = 150 ตัว'})</span>
+                        </div>
+                        <span class="text-[10px] text-gray-400">แพ้สะสมก่อนหน้า: ${data.prev_lose_streak} วัน</span>
+                    </div>
+                `;
+            }
+
+            const container = document.getElementById('picksContainer');
+            container.innerHTML = '';
+            
+            data.picks.forEach((it) => {
+                const card = document.createElement('div');
+                card.className = 'glass rounded-2xl p-4 border border-darkBorder space-y-3 shadow-lg';
+                
+                let hPills = it.h_top.map(x => `<span class="px-2 py-0.5 rounded bg-orange-500/20 text-orange-300 font-bold text-xs border border-orange-500/30">${x}</span>`).join(' ');
+                let tPills = it.t_top.map(x => `<span class="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold text-xs border border-amber-500/30">${x}</span>`).join(' ');
+                let uPills = it.u_top.map(x => `<span class="px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-300 font-bold text-xs border border-yellow-500/30">${x}</span>`).join(' ');
+                
+                let statusRight = '';
+                if (it.actual_top3) {
+                    const hitCls3d = it.hit_3d ? 'text-emerald-300 bg-emerald-500/25 border-emerald-500/50' : 'text-rose-300 bg-rose-500/20 border-rose-500/40';
+                    const hitTxt3d = it.hit_3d ? '🎯 3D แตก!' : '❌ หลุด';
+                    statusRight = `<span class="text-xs font-extrabold ${hitCls3d} border px-2.5 py-0.5 rounded-full">${hitTxt3d} บน:${it.actual_top3}</span>`;
+                } else {
+                    statusRight = `<span class="text-[10px] font-mono text-orange-400 bg-orange-500/10 border border-orange-500/30 px-2 py-0.5 rounded-full font-bold">⏳ รอผล ${it.draw_time}</span>`;
+                }
+
+                card.innerHTML = `
+                    <div class="flex items-center justify-between border-b border-darkBorder/50 pb-2">
+                        <div>
+                            <h3 class="font-extrabold text-base text-white">${it.name}</h3>
+                            <p class="text-[11px] text-gray-400">ปิดรับ: <span class="text-orange-400 font-semibold">${it.draw_time}</span></p>
+                        </div>
+                        ${statusRight}
+                    </div>
+
+                    <div class="p-3 rounded-xl bg-gradient-to-br from-orange-500/10 to-slate-900 border border-orange-500/40 space-y-2.5">
+                        <div class="flex justify-between items-center">
+                            <span class="text-xs font-bold text-orange-300 flex items-center gap-1.5">
+                                ${it.formula_label}
+                            </span>
+                            <span class="text-[10px] font-bold text-orange-300 bg-orange-500/15 px-2 py-0.5 rounded border border-orange-500/30">ทุน ${it.nums_3d_count}฿ จ่าย 850฿</span>
+                        </div>
+                        <div class="text-[11px] text-gray-300 space-y-1 bg-slate-950/60 p-2 rounded-lg border border-darkBorder/60">
+                            <div class="flex items-center gap-1.5 flex-wrap"><span class="text-gray-400 w-10">หลักร้อย:</span> ${hPills}</div>
+                            <div class="flex items-center gap-1.5 flex-wrap"><span class="text-gray-400 w-10">หลักสิบ:</span> ${tPills}</div>
+                            <div class="flex items-center gap-1.5 flex-wrap"><span class="text-gray-400 w-10">หน่วย:</span> ${uPills}</div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2 pt-0.5">
+                            <button onclick="copyRaw('${it.nums_3d_comma}', '3 ตัวตรง (${it.nums_3d_count} ตัว) คั่นจุลภาค', '${it.name}')" class="py-2 rounded-xl bg-orange-500/20 hover:bg-orange-500/30 border border-orange-500/40 text-orange-300 text-xs font-bold flex items-center justify-center gap-1.5 active:scale-95 transition">
+                                <i class="fa-regular fa-copy"></i> คัดลอก 3 ตัว (${it.nums_3d_count})
+                            </button>
+                            <button onclick="copyRaw('${it.nums_3d_space}', '3 ตัวตรง (${it.nums_3d_count} ตัว) เว้นวรรค', '${it.name}')" class="py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-600 text-gray-300 text-xs font-semibold flex items-center justify-center gap-1.5 active:scale-95 transition">
+                                <i class="fa-solid fa-font"></i> คัดลอก (เว้นวรรค)
+                            </button>
+                        </div>
+                        <div class="pt-1 border-t border-darkBorder/40 flex justify-between items-center text-[10px] text-gray-400">
+                            <span>ต้องการสลับคัดลอกอีกสูตรด้วยตัวเอง?</span>
+                            <button onclick="copyRaw('${it.nums_3d_alt_comma}', '3 ตัวตรง สูตรสำรอง (${it.nums_3d_alt_count} ตัว)', '${it.name}')" class="text-purple-300 hover:text-purple-200 underline font-semibold">
+                                คัดลอก${it.use_formula_b ? 'สูตร A (ปกติ)' : 'สูตร B (แก้ทาง)'} (${it.nums_3d_alt_count} ตัว)
+                            </button>
+                        </div>
+                    </div>
+                `;
+                container.appendChild(card);
+            });
+
+            document.getElementById('picksLoading').classList.add('hidden');
+        }
+
         async function loadPicks() {
             try {
-                const res = await fetch('/api/picks');
+                const res = await fetch('/api/picks?_t=' + Date.now(), { cache: 'no-store' });
                 const data = await res.json();
-                document.getElementById('picksDateHeader').innerText = `งวดประจำวันที่ ${data.date}`;
-                document.getElementById('marketBadge').innerText = data.is_weekend ? '🌴 หวยวันหยุด (ส-อา)' : '💼 ตลาดหุ้นหลัก (จ-ศ)';
-
-                // Render 2D Top 4 Hot Markets section
-                const sec2d = document.getElementById('picks2dSection');
-                const cont2d = document.getElementById('picks2dContainer');
-                const back2d = document.getElementById('picks2dBackupContainer');
-                cont2d.innerHTML = '';
-                back2d.innerHTML = '';
-
-                if (data.picks_2d_top4 && data.picks_2d_top4.length > 0 && !data.is_weekend) {
-                    sec2d.classList.remove('hidden');
-                    let sum1x = 0, sumAlt = 0, sumBoost = 0;
-                    data.picks_2d_top4.forEach(it => {
-                        sum1x += it.cost_1x;
-                        sumAlt += it.cost_alt;
-                        sumBoost += it.cost_boost;
-                        cont2d.insertAdjacentHTML('beforeend', build2dCardHtml(it, false));
-                    });
-                    (data.picks_2d_backup || []).forEach(it => {
-                        back2d.insertAdjacentHTML('beforeend', build2dCardHtml(it, true));
-                    });
-                    document.getElementById('picks2dSummaryText').innerHTML = `
-                        วันนี้คัด 4 ตลาดฮอต: <b class="text-emerald-300">${data.picks_2d_top4.map(x => x.short_name).join(', ')}</b><br>
-                        ทุนรวมวันนี้: คงที่ 1x = <b>${sum1x}฿</b> | สลับ 1x↔2x = <b class="text-emerald-300">${sumAlt}฿</b> | อัดสูตร B 2x = <b class="text-amber-300">${sumBoost}฿</b>
-                    `;
-                } else {
-                    sec2d.classList.add('hidden');
-                }
-                
-                // Render 3D Cube Sniper section
-                const sec3d = document.getElementById('picks3dSection');
-                sec3d.classList.remove('hidden');
-                const banner = document.getElementById('regimeBanner');
-                if (data.use_formula_b) {
-                    banner.className = 'glass rounded-2xl p-3 border border-purple-500/50 bg-gradient-to-r from-purple-500/20 to-slate-900';
-                    banner.innerHTML = `
-                        <div class="flex items-center justify-between">
-                            <div class="flex items-center gap-2">
-                                <span class="px-2 py-0.5 rounded-lg bg-purple-500/30 text-purple-200 font-extrabold text-xs border border-purple-400/40">🔄 3D สูตร B ทำงานอัตโนมัติ</span>
-                                <span class="text-xs text-purple-200 font-semibold">โหมดแก้ทางวันที่ 3 (Mid-Cool 5×5×6)</span>
-                            </div>
-                            <span class="text-[10px] text-purple-300">สถิติเข้า 7/7 (100%)</span>
-                        </div>
-                    `;
-                } else {
-                    banner.className = 'glass rounded-2xl p-3 border border-orange-500/40 bg-gradient-to-r from-orange-500/10 to-slate-900';
-                    banner.innerHTML = `
-                        <div class="flex items-center justify-between">
-                            <div class="flex items-center gap-2">
-                                <span class="px-2 py-0.5 rounded-lg bg-orange-500/20 text-orange-300 font-extrabold text-xs border border-orange-500/40">🎯 หวย 3 ตัวบน (สูตร A)</span>
-                                <span class="text-xs text-gray-200 font-semibold">3D Cube Sniper (${data.is_weekend ? '4×3×10 = 120 ตัว' : '5×5×6 = 150 ตัว'})</span>
-                            </div>
-                            <span class="text-[10px] text-gray-400">แพ้สะสมก่อนหน้า: ${data.prev_lose_streak} วัน</span>
-                        </div>
-                    `;
-                }
-
-                const container = document.getElementById('picksContainer');
-                container.innerHTML = '';
-                
-                data.picks.forEach((it) => {
-                    const card = document.createElement('div');
-                    card.className = 'glass rounded-2xl p-4 border border-darkBorder space-y-3 shadow-lg';
-                    
-                    let hPills = it.h_top.map(x => `<span class="px-2 py-0.5 rounded bg-orange-500/20 text-orange-300 font-bold text-xs border border-orange-500/30">${x}</span>`).join(' ');
-                    let tPills = it.t_top.map(x => `<span class="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold text-xs border border-amber-500/30">${x}</span>`).join(' ');
-                    let uPills = it.u_top.map(x => `<span class="px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-300 font-bold text-xs border border-yellow-500/30">${x}</span>`).join(' ');
-                    
-                    let statusRight = it.actual_top3 
-                        ? `<span class="text-xs font-extrabold text-amber-300 bg-amber-500/20 border border-amber-500/40 px-2.5 py-0.5 rounded-full">ผลออก: ${it.actual_top3}</span>`
-                        : `<span class="text-[10px] font-mono text-orange-400 bg-orange-500/10 border border-orange-500/30 px-2 py-0.5 rounded-full font-bold">3D Sniper</span>`;
-
-                    card.innerHTML = `
-                        <div class="flex items-center justify-between border-b border-darkBorder/50 pb-2">
-                            <div>
-                                <h3 class="font-extrabold text-base text-white">${it.name}</h3>
-                                <p class="text-[11px] text-gray-400">ปิดรับ: <span class="text-orange-400 font-semibold">${it.draw_time}</span></p>
-                            </div>
-                            ${statusRight}
-                        </div>
-
-                        <div class="p-3 rounded-xl bg-gradient-to-br from-orange-500/10 to-slate-900 border border-orange-500/40 space-y-2.5">
-                            <div class="flex justify-between items-center">
-                                <span class="text-xs font-bold text-orange-300 flex items-center gap-1.5">
-                                    ${it.formula_label}
-                                </span>
-                                <span class="text-[10px] font-bold text-orange-300 bg-orange-500/15 px-2 py-0.5 rounded border border-orange-500/30">ทุน ${it.nums_3d_count}฿ จ่าย 850฿</span>
-                            </div>
-                            <div class="text-[11px] text-gray-300 space-y-1 bg-slate-950/60 p-2 rounded-lg border border-darkBorder/60">
-                                <div class="flex items-center gap-1.5 flex-wrap"><span class="text-gray-400 w-10">หลักร้อย:</span> ${hPills}</div>
-                                <div class="flex items-center gap-1.5 flex-wrap"><span class="text-gray-400 w-10">หลักสิบ:</span> ${tPills}</div>
-                                <div class="flex items-center gap-1.5 flex-wrap"><span class="text-gray-400 w-10">หน่วย:</span> ${uPills}</div>
-                            </div>
-                            <div class="grid grid-cols-2 gap-2 pt-0.5">
-                                <button onclick="copyRaw('${it.nums_3d_comma}', '3 ตัวตรง (${it.nums_3d_count} ตัว) คั่นจุลภาค', '${it.name}')" class="py-2 rounded-xl bg-orange-500/20 hover:bg-orange-500/30 border border-orange-500/40 text-orange-300 text-xs font-bold flex items-center justify-center gap-1.5 active:scale-95 transition">
-                                    <i class="fa-regular fa-copy"></i> คัดลอก 3 ตัว (${it.nums_3d_count})
-                                </button>
-                                <button onclick="copyRaw('${it.nums_3d_space}', '3 ตัวตรง (${it.nums_3d_count} ตัว) เว้นวรรค', '${it.name}')" class="py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-600 text-gray-300 text-xs font-semibold flex items-center justify-center gap-1.5 active:scale-95 transition">
-                                    <i class="fa-solid fa-font"></i> คัดลอก (เว้นวรรค)
-                                </button>
-                            </div>
-                        </div>
-                    `;
-                    container.appendChild(card);
-                });
-
-                document.getElementById('picksLoading').classList.add('hidden');
+                renderPicksData(data);
             } catch (err) {
                 console.error(err);
             }
@@ -1786,7 +2164,9 @@ HTML_TEMPLATE = """
             const ctx = document.getElementById('profitChart');
             if (!ctx) return;
             
-            const chronoData = [...historyList].reverse();
+            // For the chart, only plot days that have at least 1 completed draw so a morning with 0 draws doesn't add a flat tail
+            const chartDays = historyList.filter(h => (h.bets_2d_count > 0 || h.draws_count > 0));
+            const chronoData = [...chartDays].reverse();
             const labels = chronoData.map(h => h.raw_date);
             
             let cum3d = 0;
@@ -1800,7 +2180,7 @@ HTML_TEMPLATE = """
             }
 
             const datasets = [];
-            if (selectedModels['19d']) {
+            if (dayGroup === 'wd' && selectedModels['19d']) {
                 datasets.push({
                     label: '🔥 2 ตัว (คัด 4 ตลาด/วัน + สูตร B)',
                     data: data19d,
@@ -1812,9 +2192,9 @@ HTML_TEMPLATE = """
                     pointHitRadius: 10
                 });
             }
-            if (selectedModels['3d']) {
+            if (dayGroup === 'we' || selectedModels['3d']) {
                 datasets.push({
-                    label: '🎯 3D Cube Sniper (+สูตร B)',
+                    label: dayGroup === 'we' ? '🌴 3 ตัวบน หวยวันหยุด (เสาร์–อาทิตย์)' : '🎯 3 ตัวบน หวยหุ้น (สูตร A + สลับ B วันที่ 3)',
                     data: data3d,
                     borderColor: '#F59E0B',
                     backgroundColor: 'rgba(245, 158, 11, 0.1)',
@@ -1906,7 +2286,7 @@ HTML_TEMPLATE = """
                 document.getElementById('historyLoading').classList.remove('hidden');
                 document.getElementById('historyContainer').classList.add('hidden');
                 
-                const res = await fetch('/api/history');
+                const res = await fetch('/api/history?_t=' + Date.now(), { cache: 'no-store' });
                 const data = await res.json();
                 historyData = data;
                 
@@ -1921,64 +2301,77 @@ HTML_TEMPLATE = """
             const data = historyData;
             const st = data.stats;
             
+            // Separate weekday (Mon-Fri) and weekend (Sat-Sun) completely
+            const groupDaysAll = data.history.filter(h => dayGroup === 'we' ? h.is_weekend : !h.is_weekend);
+
             let totalProfit3d = 0;
             let totalProfit19d = 0;
             let totalBets19d = 0;
+            let totalBets3d = 0;
+            let hits3dGroup = 0;
+            let draws3dGroup = 0;
             
-            data.history.forEach(h => {
+            groupDaysAll.forEach(h => {
                 totalProfit3d += getDayModelProfit(h, '3d');
                 totalProfit19d += getDayModelProfit(h, '19d');
                 totalBets19d += getDayModelBets(h, '19d');
+                totalBets3d += getDayModelBets(h, '3d');
+                draws3dGroup += h.draws_count || 0;
+                (h.draws || []).forEach(d => { if (!d.is_pending && d.hit_3d) hits3dGroup++; });
             });
             
             let filteredTotalProfit = 0;
-            if (selectedModels['3d']) filteredTotalProfit += totalProfit3d;
-            if (selectedModels['19d']) filteredTotalProfit += totalProfit19d;
+            if (dayGroup === 'we') {
+                filteredTotalProfit = totalProfit3d;
+                const roi3dWe = totalBets3d > 0 ? ((totalProfit3d / totalBets3d) * 100).toFixed(1) : '0.0';
+                document.getElementById('cardRoiText').innerText = `3D วันหยุด แตก ${hits3dGroup}/${draws3dGroup} รอบ | ROI: ${totalProfit3d >= 0 ? '+' : ''}${roi3dWe}%`;
+            } else {
+                if (selectedModels['3d']) filteredTotalProfit += totalProfit3d;
+                if (selectedModels['19d']) filteredTotalProfit += totalProfit19d;
+                const roi2d = totalBets19d > 0 ? ((totalProfit19d / totalBets19d) * 100).toFixed(1) : '0.0';
+                document.getElementById('cardRoiText').innerText = `2D ถูก ${st.total_hits_2d}/${st.total_draws_2d} ไม้ (48.7%) | ROI 2D: +${roi2d}%`;
+            }
 
-            const roi2d = totalBets19d > 0 ? ((totalProfit19d / totalBets19d) * 100).toFixed(1) : '0.0';
-            document.getElementById('cardRoiText').innerText = `ถูก ${st.total_hits_2d}/${st.total_draws_2d} ไม้ (48.7%) | ROI 2D: +${roi2d}%`;
             document.getElementById('cardProfit3d').innerText = `${totalProfit3d > 0 ? '+' : ''}${totalProfit3d.toLocaleString()} ฿`;
             document.getElementById('cardProfit19d').innerText = `${totalProfit19d > 0 ? '+' : ''}${totalProfit19d.toLocaleString()} ฿`;
             document.getElementById('cardTotalProfitAll').innerText = `${filteredTotalProfit > 0 ? '+' : ''}${filteredTotalProfit.toLocaleString()} ฿`;
 
-            // Filter days that have bets in the currently selected models
-            const visibleDays = data.history.filter(h => {
+            // Filter days in current dayGroup (always include live today so user sees today immediately!)
+            const visibleDays = groupDaysAll.filter(h => {
+                if (h.is_live_today) return true;
+                if (dayGroup === 'we') return getDayModelBets(h, '3d') > 0;
                 let b = 0;
                 if (selectedModels['19d']) b += getDayModelBets(h, '19d');
                 if (selectedModels['3d']) b += getDayModelBets(h, '3d');
                 return b > 0;
             });
-            document.getElementById('resTotalDays').innerText = `${visibleDays.length} วัน`;
+            document.getElementById('resTotalDays').innerText = `${visibleDays.length} วัน (${dayGroup === 'we' ? 'ส-อา' : 'จ-ศ'})`;
 
             renderChart(visibleDays);
 
+            // Compute global stats for Tab 3 (Mon-Fri vs Sat-Sun)
             let wdWinDays = 0, wdLossDays = 0;
             let weWinDays = 0, weLossDays = 0;
             let wdProfit = 0, weProfit = 0;
             let wdBets = 0, weBets = 0;
             
-            visibleDays.forEach(h => {
-                let hFilteredProfit = 0;
-                let hFilteredBets = 0;
-                if (selectedModels['3d']) {
-                    hFilteredProfit += getDayModelProfit(h, '3d');
-                    hFilteredBets += getDayModelBets(h, '3d');
-                }
-                if (selectedModels['19d']) {
-                    hFilteredProfit += getDayModelProfit(h, '19d');
-                    hFilteredBets += getDayModelBets(h, '19d');
-                }
-                
+            data.history.forEach(h => {
+                if (h.is_live_today && h.bets_2d_count === 0 && h.draws_count === 0) return;
                 if (h.is_weekend) {
-                    if (hFilteredProfit > 0) weWinDays++;
-                    else if (hFilteredBets > 0) weLossDays++;
-                    weProfit += hFilteredProfit;
-                    weBets += hFilteredBets;
+                    const p = getDayModelProfit(h, '3d');
+                    const b = getDayModelBets(h, '3d');
+                    if (p > 0) weWinDays++;
+                    else if (b > 0) weLossDays++;
+                    weProfit += p;
+                    weBets += b;
                 } else {
-                    if (hFilteredProfit > 0) wdWinDays++;
-                    else if (hFilteredBets > 0) wdLossDays++;
-                    wdProfit += hFilteredProfit;
-                    wdBets += hFilteredBets;
+                    let p = 0, b = 0;
+                    if (selectedModels['3d']) { p += getDayModelProfit(h, '3d'); b += getDayModelBets(h, '3d'); }
+                    if (selectedModels['19d']) { p += getDayModelProfit(h, '19d'); b += getDayModelBets(h, '19d'); }
+                    if (p > 0) wdWinDays++;
+                    else if (b > 0) wdLossDays++;
+                    wdProfit += p;
+                    wdBets += b;
                 }
             });
 
@@ -2001,55 +2394,79 @@ HTML_TEMPLATE = """
             const container = document.getElementById('historyContainer');
             container.innerHTML = '';
             
+            const show2d = (dayGroup === 'wd' && selectedModels['19d']);
+            const show3d = (dayGroup === 'we' || selectedModels['3d']);
+
             visibleDays.forEach((h) => {
                 const card = document.createElement('div');
-                card.className = 'glass rounded-2xl p-3.5 border border-darkBorder space-y-2.5 shadow-md';
+                card.className = h.is_live_today
+                    ? 'glass rounded-2xl p-3.5 border-2 border-teal-400/70 bg-gradient-to-br from-teal-500/10 to-slate-900 space-y-2.5 shadow-xl'
+                    : 'glass rounded-2xl p-3.5 border border-darkBorder space-y-2.5 shadow-md';
                 
                 let dayProfit = 0;
                 let dayBets = 0;
-                if (selectedModels['3d']) {
+                if (show3d) {
                     dayProfit += getDayModelProfit(h, '3d');
                     dayBets += getDayModelBets(h, '3d');
                 }
-                if (selectedModels['19d']) {
+                if (show2d) {
                     dayProfit += getDayModelProfit(h, '19d');
                     dayBets += getDayModelBets(h, '19d');
                 }
                 
-                const statusBadge = dayProfit > 0 
-                    ? `<span class="px-2 py-0.5 rounded-full text-[11px] font-extrabold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"><i class="fa-solid fa-check"></i> กำไร +${dayProfit.toLocaleString()} ฿</span>`
-                    : dayProfit < 0
-                    ? `<span class="px-2 py-0.5 rounded-full text-[11px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30"><i class="fa-solid fa-xmark"></i> ติดลบ ${Math.abs(dayProfit).toLocaleString()} ฿</span>`
-                    : `<span class="px-2 py-0.5 rounded-full text-[11px] font-bold bg-slate-800 text-gray-400 border border-slate-700">➖ เท่าทุน 0 ฿</span>`;
+                let statusBadge = '';
+                if (h.is_live_today && h.bets_2d_count === 0 && h.draws_count === 0) {
+                    statusBadge = `<span class="px-2.5 py-0.5 rounded-full text-[11px] font-extrabold bg-teal-500/20 text-teal-300 border border-teal-400/40">⏳ รอผลออกวันนี้</span>`;
+                } else if (dayProfit > 0) {
+                    statusBadge = `<span class="px-2 py-0.5 rounded-full text-[11px] font-extrabold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"><i class="fa-solid fa-check"></i> กำไร +${dayProfit.toLocaleString()} ฿</span>`;
+                } else if (dayProfit < 0) {
+                    statusBadge = `<span class="px-2 py-0.5 rounded-full text-[11px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30"><i class="fa-solid fa-xmark"></i> ติดลบ ${Math.abs(dayProfit).toLocaleString()} ฿</span>`;
+                } else {
+                    statusBadge = `<span class="px-2 py-0.5 rounded-full text-[11px] font-bold bg-slate-800 text-gray-400 border border-slate-700">➖ เท่าทุน 0 ฿</span>`;
+                }
 
                 let headerBadges = '';
-                if (selectedModels['19d'] && h.bets_2d_count > 0) {
-                    headerBadges += `<span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold ml-1.5">2D ถูก ${h.wins_2d}/${h.bets_2d_count} (ทุน ${dayBets}฿)</span>`;
+                if (h.is_live_today) {
+                    headerBadges += `<span class="px-2 py-0.5 rounded-full bg-teal-500 text-slate-950 text-[10px] font-black ml-1.5">📡 วันนี้ (อัปเดตสด)</span>`;
+                }
+                if (show2d && (h.bets_2d_count > 0 || h.is_live_today)) {
+                    const tot2d = h.is_live_today ? `${h.bets_2d_count}/${h.planned_2d_count || 4}` : `${h.bets_2d_count}`;
+                    headerBadges += `<span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold ml-1.5">2D ถูก ${h.wins_2d}/${tot2d}</span>`;
                     if (h.any_b_2d) {
                         headerBadges += `<span class="px-1.5 py-0.5 rounded bg-purple-500/25 text-purple-200 border border-purple-400/40 text-[10px] font-bold ml-1">🔄 มีสูตร B</span>`;
                     }
                 }
-                if (selectedModels['3d'] && h.draws_count > 0) {
+                if (show3d && (h.draws_count > 0 || h.is_live_today)) {
                     headerBadges += h.use_b
-                        ? `<span class="px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/40 text-[10px] font-bold ml-1.5">🔄 3D สูตร B</span>`
-                        : `<span class="px-1.5 py-0.5 rounded bg-slate-800 text-gray-400 border border-slate-700 text-[10px] ml-1.5">3D สูตร A</span>`;
+                        ? `<span class="px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/40 text-[10px] font-bold ml-1.5">🔄 3D ใช้สูตร B (วันที่ 3)</span>`
+                        : `<span class="px-1.5 py-0.5 rounded bg-orange-500/15 text-orange-300 border border-orange-500/30 text-[10px] font-bold ml-1.5">🎯 3D ใช้สูตร A</span>`;
                 }
 
                 let draws2dHtml = '';
-                if (selectedModels['19d'] && h.draws_2d && h.draws_2d.length > 0) {
+                if (show2d && h.draws_2d && h.draws_2d.length > 0) {
                     draws2dHtml = h.draws_2d.map(d => {
                         let m = d.m_boost;
                         let p = d.pnl_boost;
-                        let c = d.cost_boost;
-                        if (playMode === 'all_1x' || playMode === 'sow_1x') { m = d.m_1x; p = d.pnl_1x; c = d.cost_1x; }
-                        else if (playMode === 'all_alt') { m = d.m_alt; p = d.pnl_alt; c = d.cost_alt; }
-                        else if (playMode === 'all_2x') { m = d.m_2x; p = d.pnl_2x; c = d.cost_2x; }
+                        if (playMode === 'all_1x' || playMode === 'sow_1x') { m = d.m_1x; p = d.pnl_1x; }
+                        else if (playMode === 'all_alt') { m = d.m_alt; p = d.pnl_alt; }
+                        else if (playMode === 'all_2x') { m = d.m_2x; p = d.pnl_2x; }
 
-                        const bTag = d.use_b ? `<span class="px-1.5 py-0.2 rounded bg-purple-500/30 text-purple-200 text-[9px] font-extrabold border border-purple-400/50 ml-1">🔄 สูตร B</span>` : '';
+                        const bTag = d.use_b
+                            ? `<span class="px-1.5 py-0.2 rounded bg-purple-500/30 text-purple-200 text-[9px] font-extrabold border border-purple-400/50 ml-1">🔄 สูตร B (วันที่ 3)</span>`
+                            : `<span class="px-1.5 py-0.2 rounded bg-emerald-500/15 text-emerald-300 text-[9px] font-bold border border-emerald-500/30 ml-1">สูตร A</span>`;
                         const mTag = m > 1 ? `<span class="px-1.5 py-0.2 rounded bg-amber-500/25 text-amber-300 text-[9px] font-extrabold border border-amber-500/40 ml-1">${m}x</span>` : `<span class="text-gray-400 text-[10px] ml-1">1x</span>`;
-                        const hitBadge = d.hit
-                            ? `<span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-extrabold text-[10px] border border-emerald-500/40">✅ เข้า +${p}฿</span>`
-                            : `<span class="px-2 py-0.5 rounded bg-slate-800 text-rose-300/90 text-[10px] border border-slate-700">❌ หลุด ${p}฿</span>`;
+                        
+                        let hitBadge = '';
+                        let resultLine = '';
+                        if (d.is_pending) {
+                            hitBadge = `<span class="px-2 py-0.5 rounded bg-teal-500/15 text-teal-300 font-bold text-[10px] border border-teal-500/30">⏳ รอผล ${d.draw_time}</span>`;
+                            resultLine = `<span>ปิดรับ <b class="text-teal-300">${d.draw_time}</b> (${d.nums_count} ตัว)</span>`;
+                        } else {
+                            hitBadge = d.hit
+                                ? `<span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-extrabold text-[10px] border border-emerald-500/40">✅ เข้า +${p}฿</span>`
+                                : `<span class="px-2 py-0.5 rounded bg-slate-800 text-rose-300/90 text-[10px] border border-slate-700">❌ หลุด ${p}฿</span>`;
+                            resultLine = `<span>ออก: บน <b class="text-white">${d.actual_top3}</b> | ล่าง <b class="text-white">${d.actual_bot2}</b></span>`;
+                        }
 
                         return `
                             <div class="flex items-center justify-between p-2 rounded-xl bg-slate-900/60 border ${d.use_b ? 'border-purple-500/40' : 'border-darkBorder/50'} text-xs">
@@ -2062,7 +2479,7 @@ HTML_TEMPLATE = """
                                     <div class="text-[10px] text-gray-400 flex flex-wrap gap-1.5 mt-0.5">
                                         <span class="text-emerald-300 font-semibold">${d.method_short} (${d.target_thai})</span>
                                         <span>•</span>
-                                        <span>ออก: บน <b class="text-white">${d.actual_top3}</b> | ล่าง <b class="text-white">${d.actual_bot2}</b></span>
+                                        ${resultLine}
                                     </div>
                                 </div>
                                 <div class="text-right shrink-0 pl-2">
@@ -2073,20 +2490,52 @@ HTML_TEMPLATE = """
                     }).join('');
                 }
 
+                // If today has backup 2D markets that already drew (like Nikkei Morning at 09:30), display them on Today's live card too!
+                let backupDrawnHtml = '';
+                if (h.is_live_today && show2d && h.backup_2d_drawn && h.backup_2d_drawn.length > 0) {
+                    const bkItems = h.backup_2d_drawn.map(bk => {
+                        const badge = bk.hit
+                            ? `<span class="text-emerald-300 font-bold">✅ เข้า (บน:${bk.actual_top3}|ล่าง:${bk.actual_bot2})</span>`
+                            : `<span class="text-rose-300 font-bold">❌ หลุด (บน:${bk.actual_top3}|ล่าง:${bk.actual_bot2})</span>`;
+                        return `<div class="flex justify-between items-center text-[10px] py-0.5"><span class="text-gray-300">สำรอง #${bk.rank} ${bk.name} (${bk.method_short} ${bk.target_thai})</span>${badge}</div>`;
+                    }).join('');
+                    backupDrawnHtml = `
+                        <div class="p-2 rounded-xl bg-slate-950/70 border border-slate-700/70 space-y-1">
+                            <p class="text-[10px] font-bold text-teal-300">📌 ผลตลาดสำรองที่ออกแล้ววันนี้ (ไม่ได้อยู่ใน 4 ตลาดตัวจริง):</p>
+                            ${bkItems}
+                        </div>
+                    `;
+                }
+
                 let draws3dHtml = '';
-                if (selectedModels['3d'] && h.draws && h.draws.length > 0) {
+                if (show3d && h.draws && h.draws.length > 0) {
                     draws3dHtml = h.draws.map(d => {
-                        let net3dHit = 850 - d.bet_3d;
-                        let hitBadge3d = d.hit_3d 
-                            ? `<span class="px-2 py-0.5 rounded bg-orange-500/20 text-orange-300 font-extrabold text-[10px] border border-orange-500/40">🎯 3D แตก (+${net3dHit}฿)</span>` 
-                            : `<span class="px-2 py-0.5 rounded bg-slate-800 text-gray-400 text-[10px] border border-slate-700">❌ 3D หลุด (-${d.bet_3d}฿)</span>`;
+                        let f3dBadge = d.use_b
+                            ? `<span class="px-1.5 py-0.2 rounded bg-purple-500/30 text-purple-200 text-[9px] font-extrabold border border-purple-400/50 ml-1">🔄 สูตร B</span>`
+                            : `<span class="px-1.5 py-0.2 rounded bg-orange-500/15 text-orange-300 text-[9px] font-bold border border-orange-500/30 ml-1">สูตร A</span>`;
+
+                        let hitBadge3d = '';
+                        let out3dLine = '';
+                        if (d.is_pending) {
+                            hitBadge3d = `<span class="px-2 py-0.5 rounded bg-orange-500/15 text-orange-300 font-bold text-[10px] border border-orange-500/30">⏳ รอผล ${d.draw_time || ''}</span>`;
+                            out3dLine = `รอผลออกเวลา <b class="text-orange-300">${d.draw_time || '-'}</b> (ทุน ${d.bet_3d}฿)`;
+                        } else {
+                            let net3dHit = 850 - d.bet_3d;
+                            hitBadge3d = d.hit_3d 
+                                ? `<span class="px-2 py-0.5 rounded bg-orange-500/20 text-orange-300 font-extrabold text-[10px] border border-orange-500/40">🎯 3D แตก (+${net3dHit}฿)</span>` 
+                                : `<span class="px-2 py-0.5 rounded bg-slate-800 text-gray-400 text-[10px] border border-slate-700">❌ 3D หลุด (-${d.bet_3d}฿)</span>`;
+                            out3dLine = `ออก: บน <b class="text-white">${d.actual_top3}</b> | ล่าง <b class="text-white">${d.actual_bot2 || '-'}</b>`;
+                        }
 
                         return `
                             <div class="flex items-center justify-between p-2 rounded-xl bg-slate-900/40 border border-orange-500/20 text-xs">
                                 <div class="min-w-0 flex-1">
-                                    <span class="font-bold text-orange-200">${d.name} (3 ตัวบน)</span>
+                                    <div class="flex items-center flex-wrap">
+                                        <span class="font-bold text-orange-200">${d.name} (3 ตัวบน)</span>
+                                        ${f3dBadge}
+                                    </div>
                                     <div class="text-[10px] text-gray-400 mt-0.5">
-                                        ออก: <b class="text-white">${d.actual_top3}</b>
+                                        ${out3dLine}
                                     </div>
                                 </div>
                                 <div class="text-right shrink-0 pl-2">
@@ -2107,6 +2556,7 @@ HTML_TEMPLATE = """
                     </div>
                     <div class="space-y-1.5">
                         ${draws2dHtml}
+                        ${backupDrawnHtml}
                         ${draws3dHtml}
                     </div>
                 `;
@@ -2127,11 +2577,20 @@ HTML_TEMPLATE = """
             const icon = document.getElementById('syncIcon');
             icon.classList.add('fa-spin');
             try {
-                const res = await fetch('/api/sync', { method: 'POST' });
+                const res = await fetch('/api/sync?_t=' + Date.now(), { method: 'POST', cache: 'no-store' });
                 const data = await res.json();
-                showToast('อัปเดตผลสำเร็จ!', data.logs.join(' | '));
-                loadPicks();
-                if (currentTab === 'results' || currentTab === 'stats') loadHistory();
+                showToast('อัปเดตผลสดสำเร็จ!', data.logs.join(' | '));
+                if (data.picks_payload) {
+                    renderPicksData(data.picks_payload);
+                } else {
+                    await loadPicks();
+                }
+                if (data.history_payload) {
+                    historyData = data.history_payload;
+                    renderFilteredHistory();
+                } else {
+                    await loadHistory();
+                }
             } catch(e) {
                 showToast('ข้อผิดพลาด', 'ไม่สามารถดึงผลได้');
             } finally {
