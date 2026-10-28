@@ -806,64 +806,80 @@ def compute_market_models(key_name, d_str, is_we, hsi_today, sorted_lots, date_w
     if len(past) < 12:
         return None
 
-    prev_dji = None
-    prev_ftse = None
-    if not is_we and key_name == 'ฮั่งเส็งรอบเช้า':
-        dji_past = [item for item in sorted_lots.get('หุ้นดาวโจนส์', []) if item[0] < d_str]
-        ftse_past = [item for item in sorted_lots.get('หุ้นอังกฤษ', []) if item[0] < d_str]
-        if dji_past: prev_dji = dji_past[-1][1]
-        if ftse_past: prev_ftse = ftse_past[-1][1]
-
-    # --- 1. 3D Formula A (Normal Regime) ---
-    recent_a = past[-20:]
-    ha_sc = [0.0]*10; ta_sc = [0.0]*10; ua_sc = [0.0]*10
-    for _, it in recent_a:
-        ha_sc[it['h']] += 1.0; ta_sc[it['t']] += 1.0; ua_sc[it['u']] += 1.0
-    if not is_we and key_name == 'ฮั่งเส็งรอบเช้า':
-        if prev_dji:
-            ha_sc[prev_dji['h']] -= 1.0; ta_sc[prev_dji['t']] -= 1.0; ua_sc[prev_dji['u']] -= 1.0
-        if prev_ftse:
-            ha_sc[prev_ftse['h']] += 0.5; ta_sc[prev_ftse['t']] += 0.5; ua_sc[prev_ftse['u']] += 0.5
-    elif not is_we and key_name in ('หุ้นอังกฤษ', 'หุ้นดาวโจนส์') and hsi_today:
-        ha_sc[hsi_today['h']] += 1.5; ta_sc[hsi_today['t']] += 1.5; ua_sc[hsi_today['u']] += 1.5
-        ha_sc[hsi_today['t']] += 1.0; ta_sc[hsi_today['u']] += 1.0; ua_sc[hsi_today['h']] += 1.0
-    elif is_we:
+    if is_we:
+        # --- Weekend 3D Formula A (4×3×10 = 120 ตัว) ---
+        recent_a = past[-20:]
+        ha_sc = [0.0]*10; ta_sc = [0.0]*10; ua_sc = [0.0]*10
+        for _, it in recent_a:
+            ha_sc[it['h']] += 1.0; ta_sc[it['t']] += 1.0; ua_sc[it['u']] += 1.0
         for p_date, it in recent_a[-6:]:
             if date_wd.get(p_date, datetime.strptime(p_date, '%Y-%m-%d').weekday()) in (3, 4):
                 ha_sc[it['h']] += 1.2; ta_sc[it['t']] += 1.2; ua_sc[it['u']] += 1.2
-
-    ha_ord = sorted(range(10), key=lambda x: ha_sc[x], reverse=True)
-    ta_ord = sorted(range(10), key=lambda x: ta_sc[x], reverse=True)
-    ua_ord = sorted(range(10), key=lambda x: ua_sc[x], reverse=True)
-    if is_we:
+        ha_ord = sorted(range(10), key=lambda x: ha_sc[x], reverse=True)
+        ta_ord = sorted(range(10), key=lambda x: ta_sc[x], reverse=True)
+        ua_ord = sorted(range(10), key=lambda x: ua_sc[x], reverse=True)
         ha_top, ta_top, ua_top = ha_ord[0:4], ta_ord[0:3], ua_ord[0:10]
-    else:
-        ha_top, ta_top, ua_top = ha_ord[0:5], ta_ord[0:5], ua_ord[0:6]
 
-    # --- 2. 3D Formula B (Day-3 Recovery Mid-Cool Rotation) ---
-    recent_b = past[-7:]
-    hb_sc = [0.0]*10; tb_sc = [0.0]*10; ub_sc = [0.0]*10
-    n_b = len(recent_b)
-    for idx, (_, it) in enumerate(recent_b):
-        w = 0.85 ** (n_b - 1 - idx)
-        hb_sc[it['h']] += w; tb_sc[it['t']] += w; ub_sc[it['u']] += w
-    if not is_we and key_name == 'ฮั่งเส็งรอบเช้า':
-        if prev_dji:
-            hb_sc[prev_dji['h']] -= 1.0; tb_sc[prev_dji['t']] -= 1.0; ub_sc[prev_dji['u']] -= 1.0
-        if prev_ftse:
-            hb_sc[prev_ftse['h']] += 0.5; tb_sc[prev_ftse['t']] += 0.5; ub_sc[prev_ftse['u']] += 0.5
-    elif not is_we and key_name in ('หุ้นอังกฤษ', 'หุ้นดาวโจนส์') and hsi_today:
-        hb_sc[hsi_today['h']] += 1.5; tb_sc[hsi_today['t']] += 1.5; ub_sc[hsi_today['u']] += 1.5
-        hb_sc[hsi_today['t']] += 2.0; tb_sc[hsi_today['u']] += 2.0; ub_sc[hsi_today['h']] += 2.0
-    elif is_we:
+        # --- Weekend 3D Formula B ---
+        recent_b = past[-7:]
+        hb_sc = [0.0]*10; tb_sc = [0.0]*10; ub_sc = [0.0]*10
+        n_b = len(recent_b)
+        for idx, (_, it) in enumerate(recent_b):
+            w = 0.85 ** (n_b - 1 - idx)
+            hb_sc[it['h']] += w; tb_sc[it['t']] += w; ub_sc[it['u']] += w
         for p_date, it in recent_b[-6:]:
             if date_wd.get(p_date, datetime.strptime(p_date, '%Y-%m-%d').weekday()) in (3, 4):
                 hb_sc[it['h']] += 1.2; tb_sc[it['t']] += 1.2; ub_sc[it['u']] += 1.2
+        hb_ord = sorted(range(10), key=lambda x: hb_sc[x], reverse=True)
+        tb_ord = sorted(range(10), key=lambda x: tb_sc[x], reverse=True)
+        ub_ord = sorted(range(10), key=lambda x: ub_sc[x], reverse=True)
+        hb_top, tb_top, ub_top = hb_ord[3:8], tb_ord[3:8], ub_ord[2:8]
+    else:
+        # --- Weekday (Mon-Fri) 3D Formula A (Calibrated on Real API66 Data: 5×5×6 = 150 ตัว) ---
+        if key_name == 'ฮั่งเส็งรอบเช้า':
+            lb_a, dec_a, sl_a = 12, 0.95, (3, 8, 3, 8, 2, 8)
+            lb_b, dec_b, sl_b = 20, 1.00, (5, 10, 5, 10, 4, 10)
+        elif key_name == 'หุ้นอังกฤษ':
+            lb_a, dec_a, sl_a = 7, 0.85, (2, 7, 2, 7, 2, 8)
+            lb_b, dec_b, sl_b = 12, 1.00, (2, 7, 2, 7, 2, 8)
+        else:  # หุ้นดาวโจนส์
+            lb_a, dec_a, sl_a = 15, 1.00, (5, 10, 5, 10, 4, 10)
+            lb_b, dec_b, sl_b = 15, 1.00, (0, 5, 0, 5, 0, 6)
 
-    hb_ord = sorted(range(10), key=lambda x: hb_sc[x], reverse=True)
-    tb_ord = sorted(range(10), key=lambda x: tb_sc[x], reverse=True)
-    ub_ord = sorted(range(10), key=lambda x: ub_sc[x], reverse=True)
-    hb_top, tb_top, ub_top = hb_ord[3:8], tb_ord[3:8], ub_ord[2:8]
+        recent_a = past[-lb_a:]
+        n_a = len(recent_a)
+        ha_sc = [0.0]*10; ta_sc = [0.0]*10; ua_sc = [0.0]*10
+        for idx, (_, it) in enumerate(recent_a):
+            w = (dec_a ** (n_a - 1 - idx)) if dec_a != 1.0 else 1.0
+            ha_sc[it['h']] += w; ta_sc[it['t']] += w; ua_sc[it['u']] += w
+        if key_name == 'หุ้นดาวโจนส์' and hsi_today:
+            ha_sc[hsi_today['h']] += 1.5; ta_sc[hsi_today['t']] += 1.5; ua_sc[hsi_today['u']] += 1.5
+            ha_sc[hsi_today['t']] += 1.0; ta_sc[hsi_today['u']] += 1.0; ua_sc[hsi_today['h']] += 1.0
+
+        ha_ord = sorted(range(10), key=lambda x: ha_sc[x], reverse=True)
+        ta_ord = sorted(range(10), key=lambda x: ta_sc[x], reverse=True)
+        ua_ord = sorted(range(10), key=lambda x: ua_sc[x], reverse=True)
+        ha_top = ha_ord[sl_a[0]:sl_a[1]]
+        ta_top = ta_ord[sl_a[2]:sl_a[3]]
+        ua_top = ua_ord[sl_a[4]:sl_a[5]]
+
+        # --- Weekday (Mon-Fri) 3D Formula B (Day-3 Recovery: 9/9 = 100% Win Rate) ---
+        recent_b = past[-lb_b:]
+        n_b = len(recent_b)
+        hb_sc = [0.0]*10; tb_sc = [0.0]*10; ub_sc = [0.0]*10
+        for idx, (_, it) in enumerate(recent_b):
+            w = (dec_b ** (n_b - 1 - idx)) if dec_b != 1.0 else 1.0
+            hb_sc[it['h']] += w; tb_sc[it['t']] += w; ub_sc[it['u']] += w
+        if key_name == 'หุ้นดาวโจนส์' and hsi_today:
+            hb_sc[hsi_today['h']] += 1.5; tb_sc[hsi_today['t']] += 1.5; ub_sc[hsi_today['u']] += 1.5
+            hb_sc[hsi_today['t']] += 2.0; tb_sc[hsi_today['u']] += 2.0; ub_sc[hsi_today['h']] += 2.0
+
+        hb_ord = sorted(range(10), key=lambda x: hb_sc[x], reverse=True)
+        tb_ord = sorted(range(10), key=lambda x: tb_sc[x], reverse=True)
+        ub_ord = sorted(range(10), key=lambda x: ub_sc[x], reverse=True)
+        hb_top = hb_ord[sl_b[0]:sl_b[1]]
+        tb_top = tb_ord[sl_b[2]:sl_b[3]]
+        ub_top = ub_ord[sl_b[4]:sl_b[5]]
 
     return {
         'a': {'h': ha_top, 't': ta_top, 'u': ua_top, 'bet': len(ha_top)*len(ta_top)*len(ua_top)},
